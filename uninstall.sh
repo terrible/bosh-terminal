@@ -190,6 +190,15 @@ bosh_uninstall_process_managed_file() {
 
     manifest_file="$BOSH_STATE/${key}_manifest"
 
+    # Reconcile a killed installation BEFORE interpreting an absent manifest.
+    # Ambiguous transactions are preserved and block this component removal.
+    if ! bosh_managed_txn_recover "$key" "$destination"; then
+        msg warning "Pending managed-file transaction requires attention: $key"
+        BOSH_UNINSTALL_PRESERVED=$((BOSH_UNINSTALL_PRESERVED + 1))
+        BOSH_UNINSTALL_ERRORS=$((BOSH_UNINSTALL_ERRORS + 1))
+        return 1
+    fi
+
     [[ -e "$manifest_file" || -L "$manifest_file" ]] || return 0
 
     if ! bosh_uninstall_safe_directory "$BOSH_STATE" ||
