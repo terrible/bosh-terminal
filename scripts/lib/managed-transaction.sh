@@ -122,11 +122,27 @@ bosh_managed_txn_prepare() {
 }
 
 bosh_managed_txn_finish() {
-    local dir="$1" key="$2" completed
+    local dir="$1" key="$2" completed entry filename
     [[ "$key" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
     [[ "$dir" == "$BOSH_STATE/.${key}.managed-pending" ]] || return 1
     bosh_managed_txn_safe_directory "$BOSH_STATE" || return 1
     bosh_managed_txn_safe_directory "$dir" || return 1
+
+    # Do not recursively delete an unexpected or user-modified journal
+    # directory. Only known private regular files may be cleaned.
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        filename="${entry##*/}"
+        case "$filename" in
+            record|next|previous|previous_destination) ;;
+            *) msg error "Unexpected recovery journal entry preserved: $entry"; return 1 ;;
+        esac
+        if [[ -L "$entry" || ! -f "$entry" ]]; then
+            msg error "Unsafe recovery journal entry preserved: $entry"
+            return 1
+        fi
+    done
+
     completed="$(mktemp -d "$BOSH_STATE/.${key}.managed-completed.XXXXXXXX")" || return 1
     rmdir -- "$completed" || return 1
     mv -T -- "$dir" "$completed" || return 1
