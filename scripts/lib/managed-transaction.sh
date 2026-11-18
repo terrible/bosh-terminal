@@ -95,6 +95,12 @@ bosh_managed_txn_prepare() {
         [[ "$(bosh_managed_txn_hash "$manifest")" == "$old_manifest_hash" ]] || return 1
     fi
 
+    # Keep the original destination snapshot inside the private journal.
+    if [[ "$previous_hash" != '-' ]]; then
+        cp -p -- "$destination" "$dir/previous_destination" || return 1
+        [[ "$(bosh_managed_txn_hash "$dir/previous_destination")" == "$previous_hash" ]] || return 1
+    fi
+
     encoded="$(printf '%s' "$destination" | base64 -w 0)" || return 1
     if ! (umask 077; printf '%s\n' \
         'version=1' \
@@ -140,6 +146,9 @@ bosh_managed_txn_recover() {
         msg error "Unsafe or incomplete managed transaction; preserved: $dir"
         return 1
     fi
+    [[ "$(stat -c '%a' -- "$dir")" == 700 ]] || return 1
+    [[ "$(stat -c '%a' -- "$dir/record")" == 600 ]] || return 1
+    [[ "$(stat -c '%a' -- "$dir/next")" == 600 ]] || return 1
     mapfile -t record < "$dir/record" || return 1
     (( ${#record[@]} == 6 )) || { msg error "Invalid transaction record: $dir"; return 1; }
     expected_encoded="$(printf '%s' "$destination" | base64 -w 0)" || return 1
@@ -167,6 +176,11 @@ bosh_managed_txn_recover() {
     else
         actual="$(bosh_managed_txn_hash "$dir/previous")" || return 1
         [[ "$actual" == "$previous_manifest_hash" ]] || return 1
+    fi
+    if [[ -e "$dir/previous_destination" || -L "$dir/previous_destination" ]]; then
+        [[ "$previous_hash" != '-' ]] || return 1
+        actual="$(bosh_managed_txn_hash "$dir/previous_destination")" || return 1
+        [[ "$actual" == "$previous_hash" ]] || return 1
     fi
     bosh_managed_txn_safe_directory "$(dirname -- "$destination")" || return 1
     [[ ! -L "$destination" && ( ! -e "$destination" || -f "$destination" ) ]] || return 1
