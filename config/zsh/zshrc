@@ -1,0 +1,73 @@
+# ==========================================
+# Bosh Terminal - Zsh configuration
+# Compatible con Arch Linux y derivados
+# ==========================================
+
+# Historial
+HISTFILE="${ZDOTDIR:-$HOME}/.histfile"
+HISTSIZE=1000
+SAVEHIST=1000
+
+# Edición y autocompletado
+bindkey -e
+
+# Completions de paquetes de Arch
+if [[ -d /usr/share/zsh/site-functions ]]; then
+    fpath=(/usr/share/zsh/site-functions $fpath)
+fi
+
+autoload -Uz compinit
+compinit
+
+# Oh My Zsh
+export ZSH="$HOME/.oh-my-zsh"
+
+plugins=(
+    git
+    sudo
+    archlinux
+    colored-man-pages
+)
+
+if [[ -f "$ZSH/oh-my-zsh.sh" ]]; then
+    source "$ZSH/oh-my-zsh.sh"
+fi
+
+# Autosuggestions
+for plugin in \
+    /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh \
+    /usr/share/zsh-syntax-highlighting/zsh-autosuggestions.zsh
+do
+    if [[ -f "$plugin" ]]; then
+        source "$plugin"
+        break
+    fi
+done
+
+# Espacio entre comandos
+add_newline() {
+    print -P ""
+}
+precmd_functions+=(add_newline)
+
+# Starship
+if command -v starship >/dev/null 2>&1; then
+    eval "$(starship init zsh)"
+fi
+
+# Fastfetch con imagen anime aleatoria
+if command -v fastfetch >/dev/null 2>&1; then
+    imagenes=("$HOME"/.local/share/fastfetch/anime/*.png(N))
+
+    if (( ${#imagenes[@]} )); then
+        imagen="${imagenes[$((RANDOM % ${#imagenes[@]} + 1))]}"
+        fastfetch --chafa auto --logo "$imagen" --logo-width 40 --logo-height 25
+    else
+        fastfetch
+    fi
+fi
+
+# Syntax highlighting: debe cargarse al final
+if [[ -f /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ]]; then
+    source /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+fi

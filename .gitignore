@@ -1,0 +1,13 @@
+# Local backups
+*.backup-*
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.swp
+*~
+
+# Private original configuration
+/config/zsh/zshrc.original
+/README.md.new
+/README.md.pre-publication

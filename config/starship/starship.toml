@@ -1,0 +1,4 @@
+format = """
+[ Bosh ➜](bold purple) """
+
+add_newline = false
