@@ -75,7 +75,7 @@ bosh_managed_txn_prune_dir() {
     local prefix suffix own_uid entry name manifest manifest_hash='-' dest_hash='-'
     local prev_hash next_hash prev_manifest_hash next_manifest_hash encoded
     local -a record=()
-    local entries=0
+    local entry_count=0
 
     [[ "$key" =~ ^[a-zA-Z0-9_-]+$ && "$destination" == /* ]] || return 1
     [[ "$phase" == prepare || "$phase" == completed ]] || return 1
@@ -104,7 +104,7 @@ bosh_managed_txn_prune_dir() {
         [[ ! -L "$entry" && -f "$entry" ]] || return 1
         [[ "$(stat -c '%u' -- "$entry")" == "$own_uid" ]] || return 1
         [[ "$(stat -c '%h' -- "$entry")" == 1 ]] || return 1
-        entries=$((entries + 1))
+        entry_count=$((entry_count + 1))
     done
 
     # For a completed journal, prove that the system still matches the state
@@ -146,7 +146,7 @@ bosh_managed_txn_prune_dir() {
                 return 1
             }
         fi
-    elif [[ "$phase" == completed && "$entries" != 0 ]]; then
+    elif [[ "$phase" == completed && "$entry_count" != 0 ]]; then
         # Missing record with remaining files is ambiguous, not disposable.
         msg error "Incomplete completed journal preserved: $dir"
         return 1
