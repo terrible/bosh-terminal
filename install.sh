@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 
 source "$PROJECT_DIR/scripts/lib/common.sh"
+source "$PROJECT_DIR/scripts/lib/managed-transaction.sh"
 
 # ------------------------------------------------------------
 # Paths
@@ -601,6 +602,8 @@ install_managed_file() {
     local -a previous=()
     local -a decoded_values=()
     local -a manifest_fields=()
+    local pending_manifest=""
+    local manifest_index=0
 
     if [[ ! "$state_key" =~ ^[a-zA-Z0-9_-]+$ ]]; then
         msg error "Invalid or missing state key."
@@ -614,6 +617,7 @@ install_managed_file() {
 
     ensure_directory "$BOSH_STATE" || return 1
     ensure_directory "$(dirname "$destination")" || return 1
+    bosh_managed_txn_recover "$state_key" "$destination" || return 1
 
     manifest_file="$BOSH_STATE/${state_key}_manifest"
 
@@ -903,6 +907,1999 @@ install_managed_file() {
         bosh_remove_temp_file "$temp_file"
         return 1
     fi
+
+    # Journal the expected manifest and original backup BEFORE replacement.
+    if [[ "$backup_path_b64" == "-" ]]; then
+        original_mode="-"
+    fi
+    manifest_fields=(
+        sha256 "$source_hash"
+        preexisting "$existed_before"
+        destination_b64 "$destination_b64"
+        backup_path_b64 "$backup_path_b64"
+        backup_sha256 "$backup_hash"
+    )
+    if [[ -n "$original_mode" ]]; then
+        manifest_fields+=(original_mode "$original_mode")
+    fi
+    pending_manifest="version=1"
+        rollback_file="$(mktemp "${destination}.bosh-rollback.XXXXXX")" || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+
+        if ! cp -p -- "$destination" "$rollback_file"; then
+            bosh_remove_temp_file "$temp_file" || true
+            bosh_remove_rollback_file "$rollback_file" || true
+            return 1
+        fi
+
+        if ! bosh_verify_rollback_file "$rollback_file" "$initial_destination_hash"; then
+            bosh_remove_temp_file "$temp_file" || true
+            msg error "Rollback snapshot verification failed; preserved: $rollback_file"
+            return 1
+        fi
+
+        current_hash="$(sha256sum -- "$destination")" || {
+            bosh_remove_temp_file "$temp_file" || true
+            bosh_remove_rollback_file "$rollback_file" || true
+            return 1
+        }
+        current_hash="${current_hash%% *}"
+
+        if [[ "$current_hash" != "$initial_destination_hash" ]]; then
+            bosh_remove_temp_file "$temp_file" || true
+            bosh_remove_rollback_file "$rollback_file" || true
+            msg error "Destination changed during installation."
+            return 1
+        fi
+
+        if ! mv -fT -- "$temp_file" "$destination"; then
+            bosh_remove_temp_file "$temp_file" || true
+            bosh_remove_rollback_file "$rollback_file" || true
+            return 1
+        fi
+
+        bosh_forget_temp "$temp_file"
+    else
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "Destination appeared during installation."
+            return 1
+        fi
+
+        if ! mv -nT -- "$temp_file" "$destination"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+
+        if [[ -e "$temp_file" || -L "$temp_file" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "Existing destination preserved: $destination"
+            return 1
+        fi
+
+        bosh_forget_temp "$temp_file"
+    fi
+
+    file_hash="$(sha256sum -- "$destination")" || {
+        if [[ -n "$rollback_file" ]]; then
+            bosh_restore_rollback_file \
+                "$rollback_file" "$destination" \
+                "$source_hash" "$initial_destination_hash" ||
+                msg error "Rollback recovery needs attention; snapshot path: $rollback_file"
+        else
+            msg warning "Could not verify installed file; destination preserved: $destination"
+        fi
+        return 1
+    }
+    file_hash="${file_hash%% *}"
+
+    if [[ "$file_hash" != "$source_hash" ]]; then
+        if [[ -n "$rollback_file" ]]; then
+            bosh_restore_rollback_file \
+                "$rollback_file" "$destination" \
+                "$source_hash" "$initial_destination_hash" ||
+                msg error "Rollback recovery needs attention; snapshot path: $rollback_file"
+        else
+            msg warning "Unexpected file content; destination preserved: $destination"
+        fi
+
+        msg error "Installed file hash does not match its source."
+        return 1
+    fi
+
+    if [[ "$backup_path_b64" == "-" ]]; then
+        original_mode="-"
+    fi
+
+    manifest_fields=(
+        sha256 "$file_hash"
+        preexisting "$existed_before"
+        destination_b64 "$destination_b64"
+        backup_path_b64 "$backup_path_b64"
+        backup_sha256 "$backup_hash"
+    )
+
+    # Keep the old schema when an existing backup has no recoverable mode.
+    if [[ -n "$original_mode" ]]; then
+        manifest_fields+=(original_mode "$original_mode")
+    fi
+
+    if ! write_manifest "$state_key" managed_file "${manifest_fields[@]}"; then
+
+        if [[ -n "$rollback_file" ]]; then
+            bosh_restore_rollback_file \
+                "$rollback_file" "$destination" \
+                "$file_hash" "$initial_destination_hash" ||
+                msg error "Rollback recovery needs attention; snapshot path: $rollback_file"
+        else
+            bosh_remove_file_if_hash_matches "$destination" "$file_hash" || true
+        fi
+
+        bosh_managed_txn_recover "$state_key" "$destination" || true
+        msg error "Could not register the managed file."
+        return 1
+    fi
+
+    bosh_managed_txn_recover "$state_key" "$destination" || return 1
+    [[ -z "$rollback_file" ]] || bosh_remove_rollback_file "$rollback_file" || true
+
+    if (( existed_before )); then
+        msg success "Updated: $destination"
+    else
+        msg success "Installed: $destination"
+    fi
+}
+
+# Preserve user-modified files without aborting the whole installation.
+# install_managed_file returns 2 only for this intentional skip.
+install_managed_file_or_skip() {
+    local status=0
+
+    if install_managed_file "$@"; then
+        return 0
+    else
+        status=$?
+    fi
+
+    if (( status == 2 )); then
+        return 0
+    fi
+
+    return "$status"
+}
+
+# ------------------------------------------------------------
+# Install anime images without overwriting personal files
+# ------------------------------------------------------------
+
+install_anime_images() {
+    local source_file filename destination_file
+    local name_hash state_key manifest_file
+    local filename_b64 source_hash current_hash previous_hash
+    local legacy_key legacy_state_file legacy_value
+    local candidate candidate_filename candidate_key
+    local legacy_matches
+    local file_hash temp_file rollback_file manifest_value
+    local manifest_owned
+    local -a source_files=()
+    local -a manifest_lines=()
+
+    ensure_directory "$ANIME_DEST" || return 1
+    ensure_directory "$BOSH_STATE" || return 1
+
+    source_files=("$ANIME_SOURCE"/*.png)
+
+    if (( ${#source_files[@]} == 0 )); then
+        msg error "No anime PNG images found."
+        return 1
+    fi
+
+    for source_file in "${source_files[@]}"; do
+        if [[ -L "$source_file" || ! -f "$source_file" ]]; then
+            msg error "Invalid anime asset: $source_file"
+            return 1
+        fi
+
+        filename="${source_file##*/}"
+        destination_file="$ANIME_DEST/$filename"
+
+        name_hash="$(printf '%s' "$filename" | sha256sum)" || return 1
+        name_hash="${name_hash%% *}"
+        state_key="anime_${name_hash}"
+        manifest_file="$BOSH_STATE/$state_key"
+
+        filename_b64="$(printf '%s' "$filename" | base64 -w 0)" || return 1
+
+        source_hash="$(sha256sum -- "$source_file")" || return 1
+        source_hash="${source_hash%% *}"
+
+        if [[ -L "$manifest_file" ]]; then
+            msg error "Refusing to read a symbolic link: $manifest_file"
+            return 1
+        fi
+
+        if [[ -e "$manifest_file" && ! -f "$manifest_file" ]]; then
+            msg error "Anime manifest is not a regular file: $manifest_file"
+            return 1
+        fi
+
+        manifest_owned=0
+        previous_hash=""
+
+        # Read the current versioned manifest, if present.
+        if [[ -f "$manifest_file" ]]; then
+            if ! mapfile -t manifest_lines < "$manifest_file"; then
+                msg error "Could not read anime manifest: $filename"
+                return 1
+            fi
+
+            if (( ${#manifest_lines[@]} != 4 )) ||
+               [[ "${manifest_lines[0]}" != "version=1" ||
+                  "${manifest_lines[1]}" != "component=anime_image" ||
+                  "${manifest_lines[2]}" != "filename_b64=$filename_b64" ||
+                  ! "${manifest_lines[3]}" =~ ^sha256=[a-f0-9]{64}$ ]]; then
+                msg error "Anime manifest is invalid or belongs to another filename: $filename"
+                return 1
+            fi
+
+            previous_hash="${manifest_lines[3]#sha256=}"
+            manifest_owned=1
+        else
+            # Attempt legacy migration only when the old key is unambiguous.
+            legacy_key="anime_${filename//./_}"
+            legacy_state_file="$BOSH_STATE/$legacy_key"
+
+            if [[ "$legacy_key" =~ ^[a-zA-Z0-9_-]+$ ]] &&
+               [[ -e "$legacy_state_file" || -L "$legacy_state_file" ]]; then
+
+                if [[ -L "$legacy_state_file" ]]; then
+                    msg warning "Legacy anime state is a symbolic link; preserved: $legacy_key"
+                elif [[ -f "$legacy_state_file" &&
+                        -f "$destination_file" && ! -L "$destination_file" ]]; then
+
+                    legacy_matches=0
+
+                    for candidate in "${source_files[@]}"; do
+                        candidate_filename="${candidate##*/}"
+                        candidate_key="anime_${candidate_filename//./_}"
+
+                        if [[ "$candidate_key" == "$legacy_key" ]]; then
+                            legacy_matches=$((legacy_matches + 1))
+                        fi
+                    done
+
+                    legacy_value="$(cat -- "$legacy_state_file")" || return 1
+                    current_hash="$(sha256sum -- "$destination_file")" || return 1
+                    current_hash="${current_hash%% *}"
+
+                    if (( legacy_matches == 1 )) &&
+                       { [[ "$legacy_value" == "1" ]] && cmp -s "$source_file" "$destination_file" ||
+                         [[ "$legacy_value" =~ ^[a-f0-9]{64}$ && "$legacy_value" == "$current_hash" ]]; }; then
+
+                        printf -v manifest_value '%s\n%s\n%s\n%s' \
+                            "version=1" \
+                            "component=anime_image" \
+                            "filename_b64=$filename_b64" \
+                            "sha256=$current_hash"
+
+                        write_state "$state_key" "$manifest_value" || return 1
+                        previous_hash="$current_hash"
+                        manifest_owned=1
+
+                        msg info "Legacy anime ownership migrated: $filename"
+                    else
+                        msg warning "Ambiguous or unverifiable legacy anime state preserved: $legacy_key"
+                    fi
+                fi
+            fi
+        fi
+
+        # Existing managed files may be updated only if their content
+        # still matches the previously recorded hash.
+        if (( manifest_owned )); then
+            if [[ -L "$destination_file" ]]; then
+                msg warning "Managed anime destination became a symbolic link; preserved: $filename"
+                continue
+            fi
+
+            if [[ -e "$destination_file" && ! -f "$destination_file" ]]; then
+                msg warning "Managed anime destination is not a regular file; preserved: $filename"
+                continue
+            fi
+
+            if [[ -f "$destination_file" ]]; then
+                current_hash="$(sha256sum -- "$destination_file")" || return 1
+                current_hash="${current_hash%% *}"
+
+                if [[ "$current_hash" != "$previous_hash" ]]; then
+                    msg warning "Anime image was modified outside Bosh Terminal; preserved: $filename"
+                    continue
+                fi
+
+                if [[ "$current_hash" == "$source_hash" ]]; then
+                    msg info "Anime image already installed: $filename"
+                    continue
+                fi
+            fi
+        else
+            # An existing image without verified ownership is personal.
+            if [[ -e "$destination_file" || -L "$destination_file" ]]; then
+                if [[ -f "$destination_file" && ! -L "$destination_file" ]] &&
+                   cmp -s "$source_file" "$destination_file"; then
+                    msg info "Existing anime image preserved (not managed): $filename"
+                else
+                    msg warning "Personal image preserved: $filename"
+                fi
+                continue
+            fi
+        fi
+
+        # Prepare the new image in the destination filesystem.
+        temp_file="$(mktemp "${destination_file}.bosh-tmp.XXXXXX")" || return 1
+
+        bosh_register_temp "$temp_file" file || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+
+        if ! cp -p -- "$source_file" "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+
+        rollback_file=""
+
+        if (( manifest_owned )) && [[ -f "$destination_file" ]]; then
+            rollback_file="$(mktemp "${destination_file}.bosh-rollback.XXXXXX")" || {
+                bosh_remove_temp_file "$temp_file"
+                return 1
+            }
+
+            if ! cp -p -- "$destination_file" "$rollback_file"; then
+                bosh_remove_temp_file "$temp_file" || true
+                bosh_remove_rollback_file "$rollback_file" || true
+                return 1
+            fi
+
+            if ! bosh_verify_rollback_file "$rollback_file" "$previous_hash"; then
+                bosh_remove_temp_file "$temp_file" || true
+                msg error "Anime rollback snapshot verification failed; preserved: $rollback_file"
+                return 1
+            fi
+
+            current_hash="$(sha256sum -- "$destination_file")" || {
+                bosh_remove_temp_file "$temp_file" || true
+                bosh_remove_rollback_file "$rollback_file" || true
+                return 1
+            }
+            current_hash="${current_hash%% *}"
+
+            if [[ "$current_hash" != "$previous_hash" ]]; then
+                bosh_remove_temp_file "$temp_file" || true
+                bosh_remove_rollback_file "$rollback_file" || true
+                msg warning "Anime image changed during update; preserved: $filename"
+                continue
+            fi
+
+            if ! mv -fT -- "$temp_file" "$destination_file"; then
+                bosh_remove_temp_file "$temp_file" || true
+                bosh_remove_rollback_file "$rollback_file" || true
+                return 1
+            fi
+
+            bosh_forget_temp "$temp_file"
+        else
+            if [[ -e "$destination_file" || -L "$destination_file" ]]; then
+                bosh_remove_temp_file "$temp_file"
+                msg warning "Existing destination preserved: $filename"
+                continue
+            fi
+
+            if ! mv -nT -- "$temp_file" "$destination_file"; then
+                bosh_remove_temp_file "$temp_file"
+                return 1
+            fi
+
+            if [[ -e "$temp_file" || -L "$temp_file" ]]; then
+                bosh_remove_temp_file "$temp_file"
+                msg warning "Destination appeared during installation; preserved: $filename"
+                continue
+            fi
+
+            bosh_forget_temp "$temp_file"
+        fi
+
+        file_hash="$(sha256sum -- "$destination_file")" || {
+            if [[ -n "$rollback_file" ]]; then
+                bosh_restore_rollback_file \
+                    "$rollback_file" "$destination_file" \
+                    "$source_hash" "$previous_hash" ||
+                    msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
+            else
+                msg warning "Could not verify anime image; destination preserved: $destination_file"
+            fi
+            return 1
+        }
+        file_hash="${file_hash%% *}"
+
+        if [[ "$file_hash" != "$source_hash" ]]; then
+            if [[ -n "$rollback_file" ]]; then
+                bosh_restore_rollback_file \
+                    "$rollback_file" "$destination_file" \
+                    "$source_hash" "$previous_hash" ||
+                    msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
+            else
+                msg warning "Unexpected anime image content; destination preserved: $destination_file"
+            fi
+
+            msg error "Installed anime image hash does not match: $filename"
+            return 1
+        fi
+
+        printf -v manifest_value '%s\n%s\n%s\n%s' \
+            "version=1" \
+            "component=anime_image" \
+            "filename_b64=$filename_b64" \
+            "sha256=$file_hash"
+
+        if ! write_state "$state_key" "$manifest_value"; then
+            if [[ -n "$rollback_file" ]]; then
+                bosh_restore_rollback_file \
+                    "$rollback_file" "$destination_file" \
+                    "$file_hash" "$previous_hash" ||
+                    msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
+            else
+                bosh_remove_file_if_hash_matches "$destination_file" "$file_hash" || true
+            fi
+
+            msg error "Could not register anime image: $filename"
+            return 1
+        fi
+
+        [[ -z "$rollback_file" ]] || bosh_remove_rollback_file "$rollback_file" || true
+
+        msg success "Installed or updated anime image: $filename"
+    done
+}
+# Validate and migrate an existing positional Zsh integration manifest.
+migrate_zsh_manifest() {
+    local zshrc="$HOME/.zshrc"
+    local manifest_file="$BOSH_STATE/zshrc_manifest"
+    local start_marker="${1:-}"
+    local end_marker="${2:-}"
+    local source_line="${3:-}"
+    local source_command="${4:-}"
+    local mode=""
+    local actual_hash=""
+    local expected_block_hash=""
+    local actual_block_hash=""
+    local backup_path=""
+    local backup_path_b64="-"
+    local backup_hash="-"
+    local original_mode=""
+    local canonical_b64=""
+    local versioned=0
+    local -a legacy=()
+    local -a decoded_values=()
+
+    if [[ -L "$BOSH_STATE" ||
+          ( -e "$BOSH_STATE" && ! -d "$BOSH_STATE" ) ||
+          -L "$manifest_file" ||
+          ( -e "$manifest_file" && ! -f "$manifest_file" ) ]]; then
+        msg error "Zsh state path or record is not safe."
+        return 1
+    fi
+
+    if [[ -L "$zshrc" || ! -f "$zshrc" ]]; then
+        msg error "Cannot verify Zsh integration without a regular .zshrc."
+        return 1
+    fi
+
+    if [[ -z "$start_marker" || -z "$end_marker" ||
+          -z "$source_line" || -z "$source_command" ]]; then
+        msg error "Missing Zsh block validation parameters."
+        return 1
+    fi
+
+    if [[ "$(grep -Fxc -- "$start_marker" "$zshrc" || true)" != "1" ||
+          "$(grep -Fxc -- "$end_marker" "$zshrc" || true)" != "1" ]]; then
+        msg error "Zsh block markers are incomplete or duplicated."
+        return 1
+    fi
+
+    expected_block_hash="$(
+        printf '%s\n' \
+            "$start_marker" \
+            "$source_line" \
+            "$source_command" \
+            "$end_marker" | sha256sum
+    )" || return 1
+    expected_block_hash="${expected_block_hash%% *}"
+
+    actual_block_hash="$(
+        awk -v start="$start_marker" -v end="$end_marker" '
+            $0 == start {
+                if (seen_start) {
+                    invalid=1
+                    exit
+                }
+                seen_start=1
+                inside=1
+            }
+            inside {
+                print
+            }
+            $0 == end && inside {
+                seen_end=1
+                inside=0
+                exit
+            }
+            END {
+                if (invalid || !seen_start || !seen_end || inside) {
+                    exit 1
+                }
+            }
+        ' "$zshrc" | sha256sum
+    )" || {
+        msg error "Could not extract the Bosh block from .zshrc."
+        return 1
+    }
+    actual_block_hash="${actual_block_hash%% *}"
+
+    if [[ ! -e "$manifest_file" && ! -L "$manifest_file" ]]; then
+        if [[ "$actual_block_hash" != "$expected_block_hash" ]]; then
+            msg warning "The Bosh block in $HOME/.zshrc was edited; leaving it untouched."
+        else
+            msg info "Bosh Terminal block content verified; no manifest exists."
+        fi
+        return 0
+    fi
+
+    mapfile -t legacy < "$manifest_file" || return 1
+
+    if [[ "${legacy[0]:-}" == "version=1" ]]; then
+        read_manifest zshrc || return 1
+
+        if (( ${#BOSH_MANIFEST[@]} != 6 &&
+              ${#BOSH_MANIFEST[@]} != 7 )) ||
+           [[ "${BOSH_MANIFEST[component]:-}" != "zsh_integration" ||
+              ! "${BOSH_MANIFEST[mode]:-}" =~ ^(created|appended|legacy_replaced)$ ]]; then
+            msg error "Versioned Zsh manifest has an invalid schema."
+            return 1
+        fi
+
+        mode="${BOSH_MANIFEST[mode]}"
+        backup_path_b64="${BOSH_MANIFEST[backup_path_b64]:-}"
+        backup_hash="${BOSH_MANIFEST[backup_sha256]:-}"
+
+        if (( ${#BOSH_MANIFEST[@]} == 7 )); then
+            original_mode="${BOSH_MANIFEST[original_mode]:-}"
+
+            if [[ "$backup_path_b64" == "-" ]]; then
+                if [[ "$original_mode" != "-" ]]; then
+                    msg error "Versioned Zsh original mode metadata is inconsistent."
+                    return 1
+                fi
+            elif [[ ! "$original_mode" =~ ^[0-7]{3,4}$ ]]; then
+                msg error "Versioned Zsh original mode is invalid."
+                return 1
+            fi
+        else
+            # Previous schema did not record the original permissions.
+            original_mode=""
+        fi
+
+        if [[ -n "${BOSH_MANIFEST[block_sha256]+present}" &&
+              -z "${BOSH_MANIFEST[sha256]+present}" ]]; then
+
+            if [[ ! "${BOSH_MANIFEST[block_sha256]}" =~ ^[a-f0-9]{64}$ ]]; then
+                msg error "Invalid Bosh block hash in Zsh manifest."
+                return 1
+            fi
+
+            expected_block_hash="${BOSH_MANIFEST[block_sha256]}"
+            versioned=1
+
+        elif [[ -n "${BOSH_MANIFEST[sha256]+present}" &&
+                -z "${BOSH_MANIFEST[block_sha256]+present}" ]]; then
+
+            # Previous schema stored the hash of the entire .zshrc.
+            # That hash cannot validate a file with user-owned additions.
+            if [[ ! "${BOSH_MANIFEST[sha256]}" =~ ^[a-f0-9]{64}$ ]]; then
+                msg error "Invalid legacy Zsh file hash."
+                return 1
+            fi
+
+        else
+            msg error "Zsh manifest has an ambiguous hash schema."
+            return 1
+        fi
+
+        if [[ "$backup_path_b64" == "-" ]]; then
+            if [[ "$mode" != "created" || "$backup_hash" != "-" ]]; then
+                msg error "Versioned Zsh backup metadata is inconsistent."
+                return 1
+            fi
+        else
+            if [[ "$mode" == "created" ||
+                  ! "$backup_path_b64" =~ ^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$ ||
+                  ! "$backup_hash" =~ ^[a-f0-9]{64}$ ]]; then
+                msg error "Versioned Zsh backup metadata is invalid."
+                return 1
+            fi
+
+            decoded_values=()
+            mapfile -d '' -t decoded_values < <(
+                printf '%s' "$backup_path_b64" | base64 --decode 2>/dev/null
+            )
+
+            if (( ${#decoded_values[@]} != 1 )); then
+                msg error "Could not decode the Zsh backup path."
+                return 1
+            fi
+
+            backup_path="${decoded_values[0]}"
+            canonical_b64="$(printf '%s' "$backup_path" | base64 -w 0)" || return 1
+
+            if [[ "$canonical_b64" != "$backup_path_b64" ||
+                  "$backup_path" != /* ||
+                  -L "$backup_path" || ! -f "$backup_path" ]]; then
+                msg error "Zsh backup file is missing or invalid."
+                return 1
+            fi
+
+            actual_hash="$(sha256sum -- "$backup_path")" || return 1
+            actual_hash="${actual_hash%% *}"
+
+            if [[ "$actual_hash" != "$backup_hash" ]]; then
+                msg error "Zsh backup hash does not match its manifest."
+                return 1
+            fi
+        fi
+
+    else
+        # Positional legacy manifest.
+        if (( ${#legacy[@]} != 4 )) ||
+           [[ ! "${legacy[0]:-}" =~ ^(created|appended|legacy_replaced)$ ||
+              ! "${legacy[1]:-}" =~ ^[a-f0-9]{64}$ ]]; then
+            msg error "Legacy Zsh manifest is invalid; preserving it."
+            return 1
+        fi
+
+        mode="${legacy[0]}"
+        backup_path="${legacy[2]}"
+        backup_hash="${legacy[3]}"
+        backup_path_b64="-"
+
+        if [[ "$backup_path" == "-" ]]; then
+            if [[ "$mode" != "created" || "$backup_hash" != "-" ]]; then
+                msg error "Legacy Zsh backup metadata is inconsistent."
+                return 1
+            fi
+        else
+            if [[ "$mode" == "created" || "$backup_path" != /* ||
+                  -L "$backup_path" || ! -f "$backup_path" ||
+                  ! "$backup_hash" =~ ^[a-f0-9]{64}$ ]]; then
+                msg error "Legacy Zsh backup is missing or invalid."
+                return 1
+            fi
+
+            actual_hash="$(sha256sum -- "$backup_path")" || return 1
+            actual_hash="${actual_hash%% *}"
+
+            if [[ "$actual_hash" != "$backup_hash" ]]; then
+                msg error "Legacy Zsh backup hash does not match."
+                return 1
+            fi
+
+            backup_path_b64="$(printf '%s' "$backup_path" | base64 -w 0)" || return 1
+        fi
+    fi
+
+    if [[ "$actual_block_hash" != "$expected_block_hash" ]]; then
+        msg warning "The Bosh block in $HOME/.zshrc was edited; leaving it untouched."
+    else
+        msg info "Bosh Terminal block integrity verified."
+    fi
+
+    if (( versioned )); then
+        return 0
+    fi
+
+    write_manifest zshrc zsh_integration \
+        mode "$mode" \
+        block_sha256 "$expected_block_hash" \
+        backup_path_b64 "$backup_path_b64" \
+        backup_sha256 "$backup_hash" || {
+        msg error "Could not migrate the legacy Zsh manifest."
+        return 1
+    }
+
+    msg success "Legacy Zsh manifest migrated to block-based integrity."
+}
+# Integrate Bosh Terminal with .zshrc
+# ------------------------------------------------------------
+
+integrate_zsh() {
+    local zshrc="$HOME/.zshrc"
+    local start_marker="# >>> Bosh Terminal >>>"
+    local end_marker="# <<< Bosh Terminal <<<"
+    # shellcheck disable=SC2016
+   local source_line='export BOSH_CONFIG_DIR="${BOSH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/bosh-terminal}"'
+    # shellcheck disable=SC2016
+   local source_command='source "$BOSH_CONFIG_DIR/zshrc"'
+    local manifest_file="$BOSH_STATE/zshrc_manifest"
+    local start_count=0
+    local end_count=0
+   local mode=""
+    local original_hash=""
+    local current_hash=""
+    local backup_path=""
+    local backup_record="-"
+    local backup_hash="-"
+    local temp_file=""
+    local block_hash=""
+    local backup_path_b64=""
+    local current_umask=""
+    local created_mode=""
+    local original_mode="-"
+
+    if [[ -L "$zshrc" ]]; then
+        msg error "Refusing to modify a symbolic link at $HOME/.zshrc."
+        return 1
+    fi
+
+    if [[ -e "$zshrc" && ! -f "$zshrc" ]]; then
+        msg error "$HOME/.zshrc exists but is not a regular file."
+        return 1
+    fi
+
+    if [[ -f "$zshrc" ]]; then
+        start_count="$(grep -Fxc -- "$start_marker" "$zshrc" || true)"
+        end_count="$(grep -Fxc -- "$end_marker" "$zshrc" || true)"
+
+        if (( start_count > 0 || end_count > 0 )); then
+            if (( start_count != 1 || end_count != 1 )); then
+                msg error "Incomplete or duplicated Bosh Terminal block."
+                return 1
+            fi
+
+            migrate_zsh_manifest \
+                "$start_marker" \
+                "$end_marker" \
+                "$source_line" \
+                "$source_command" || return 1
+
+            msg info "Bosh Terminal block already exists."
+            return 0
+        fi
+
+        original_hash="$(sha256sum -- "$zshrc")" || return 1
+        original_hash="${original_hash%% *}"
+
+        if grep -Eq 'fastfetch --chafa auto --logo|Bosh Terminal - Zsh' "$zshrc"; then
+            msg warning "A previous Bosh configuration was detected."
+
+            confirm \
+                "¿Reemplazar $HOME/.zshrc por el cargador de Bosh? Se creará una copia completa de respaldo." \
+                "Replace $HOME/.zshrc with the Bosh loader? A complete backup will be created." || return 1
+
+            mode="legacy_replaced"
+        else
+            mode="appended"
+        fi
+    else
+        mode="created"
+    fi
+
+    if [[ -e "$manifest_file" || -L "$manifest_file" ]]; then
+        msg warning "Found an orphaned Zsh integration state record; archiving it before re-integration."
+        archive_state "zshrc_manifest" || return 1
+    fi
+
+    if [[ "$mode" != "created" ]]; then
+        create_backup "$zshrc" || return 1
+        backup_path="$BOSH_LAST_BACKUP"
+        original_mode="$BOSH_LAST_BACKUP_MODE"
+
+        if [[ ! "$original_mode" =~ ^[0-7]{3,4}$ ]]; then
+            msg error "Could not capture the original .zshrc permissions."
+            return 1
+        fi
+
+        if [[ -z "$backup_path" || -L "$backup_path" || ! -f "$backup_path" ]]; then
+            msg error "The original Zsh backup could not be verified."
+            return 1
+        fi
+        backup_record="$backup_path"
+        backup_hash="$(sha256sum -- "$backup_path")" || return 1
+        backup_hash="${backup_hash%% *}"
+    fi
+
+    temp_file="$(mktemp "$HOME/.zshrc.bosh-tmp.XXXXXX")" || return 1
+
+    bosh_register_temp "$temp_file" file || {
+        bosh_remove_temp_file "$temp_file"
+        return 1
+    }
+
+    if [[ "$mode" == "appended" || "$mode" == "legacy_replaced" ]]; then
+        if ! cp -a -- "$zshrc" "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+    fi
+
+    if [[ "$mode" == "legacy_replaced" ]]; then
+        if ! : > "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+    fi
+
+    if [[ "$mode" == "appended" && -s "$zshrc" ]]; then
+        if ! printf '\n' >> "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+    fi
+
+    if ! printf '%s\n' \
+        "$start_marker" \
+        "$source_line" \
+        "$source_command" \
+        "$end_marker" >> "$temp_file"; then
+        bosh_remove_temp_file "$temp_file"
+        return 1
+    fi
+
+    if [[ "$mode" == "created" ]]; then
+        current_umask="$(umask)" || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+
+        if [[ ! "$current_umask" =~ ^[0-7]{3,4}$ ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "Could not determine the current umask."
+            return 1
+        fi
+
+        printf -v created_mode '%o' "$(( 0666 & ~(8#$current_umask) ))"
+
+        if ! chmod "$created_mode" "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "Could not set the new .zshrc permissions."
+            return 1
+        fi
+    fi
+
+    block_hash="$(printf '%s\n' \
+        "$start_marker" \
+        "$source_line" \
+        "$source_command" \
+        "$end_marker" | sha256sum)" || {
+        bosh_remove_temp_file "$temp_file"
+        return 1
+    }
+    block_hash="${block_hash%% *}"
+
+    if [[ "$mode" != "created" ]]; then
+        if [[ -L "$zshrc" || ! -f "$zshrc" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "$HOME/.zshrc changed during installation."
+            return 1
+        fi
+
+        current_hash="$(sha256sum -- "$zshrc")" || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+        current_hash="${current_hash%% *}"
+
+        if [[ "$current_hash" != "$original_hash" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "$HOME/.zshrc changed during installation. Original preserved."
+            return 1
+        fi
+    else
+        if [[ -e "$zshrc" || -L "$zshrc" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "$HOME/.zshrc appeared during installation. Existing file preserved."
+            return 1
+        fi
+    fi
+
+    if [[ "$backup_record" == "-" ]]; then
+        backup_path_b64="-"
+    else
+        backup_path_b64="$(printf '%s' "$backup_record" | base64 -w 0)" || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+    fi
+
+    if ! write_manifest "zshrc" zsh_integration \
+        mode "$mode" \
+        block_sha256 "$block_hash" \
+        backup_path_b64 "$backup_path_b64" \
+        backup_sha256 "$backup_hash" \
+        original_mode "$original_mode"; then
+        bosh_remove_temp_file "$temp_file"
+        msg error "Could not register the Zsh integration."
+        return 1
+    fi
+
+    if [[ "$mode" == "created" ]]; then
+        if ! mv -nT -- "$temp_file" "$zshrc"; then
+            bosh_remove_temp_file "$temp_file"
+            rm -f -- "$manifest_file"
+            return 1
+        fi
+
+        if [[ -e "$temp_file" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            rm -f -- "$manifest_file"
+            msg error "Another $HOME/.zshrc appeared. Existing file preserved."
+            return 1
+        fi
+
+        bosh_forget_temp "$temp_file"
+    else
+        if ! mv -fT -- "$temp_file" "$zshrc"; then
+            bosh_remove_temp_file "$temp_file"
+            rm -f -- "$manifest_file"
+            return 1
+        fi
+
+        bosh_forget_temp "$temp_file"
+    fi
+
+    msg success "Bosh Terminal integrated into $HOME/.zshrc."
+}
+# ------------------------------------------------------------
+# Main installation
+# ------------------------------------------------------------
+
+main() {
+    preflight || return 1
+
+    acquire_install_lock || return 1
+    setup_install_traps
+
+    # Recover before further installation changes, while holding the lock.
+    bosh_managed_txn_recover zsh_config "$BOSH_HOME/zshrc" || return 1
+    bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml" || return 1
+    bosh_managed_txn_recover fastfetch "$BOSH_HOME/fastfetch.jsonc" || return 1
+    bosh_managed_txn_recover konsole_profile "$KONSOLE_DIR/bosh.profile" || return 1
+    bosh_managed_txn_recover konsole_scheme "$KONSOLE_DIR/Utterly-Sweet-Konsole.colorscheme" || return 1
+
+    install_dependencies || return 1
+    install_oh_my_zsh || return 1
+
+    install_managed_file_or_skip \
+        "$ZSH_CONFIG" \
+        "$BOSH_HOME/zshrc" "zsh_config" || return 1
+
+    install_managed_file_or_skip \
+        "$STARSHIP_CONFIG" \
+        "$BOSH_HOME/starship.toml" "starship" || return 1
+
+    install_managed_file_or_skip \
+        "$FASTFETCH_CONFIG" \
+        "$BOSH_HOME/fastfetch.jsonc" "fastfetch" || return 1
+
+    install_anime_images || return 1
+
+    integrate_zsh || return 1
+
+    install_konsole_component || return 1
+
+    msg success "Bosh Terminal installation completed."
+
+    say \
+        "Abre una nueva sesión de Zsh para utilizar Bosh Terminal." \
+        "Open a new Zsh session to use Bosh Terminal."
+
+    say \
+        "Selecciona el perfil 'bosh' en Konsole si instalaste el componente visual." \
+        "Select the 'bosh' profile in Konsole if you installed the visual component."
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
+\n'"component=managed_file"
+    for ((manifest_index = 0; manifest_index < ${#manifest_fields[@]}; manifest_index += 2)); do
+        pending_manifest+=
+        rollback_file="$(mktemp "${destination}.bosh-rollback.XXXXXX")" || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+
+        if ! cp -p -- "$destination" "$rollback_file"; then
+            bosh_remove_temp_file "$temp_file" || true
+            bosh_remove_rollback_file "$rollback_file" || true
+            return 1
+        fi
+
+        if ! bosh_verify_rollback_file "$rollback_file" "$initial_destination_hash"; then
+            bosh_remove_temp_file "$temp_file" || true
+            msg error "Rollback snapshot verification failed; preserved: $rollback_file"
+            return 1
+        fi
+
+        current_hash="$(sha256sum -- "$destination")" || {
+            bosh_remove_temp_file "$temp_file" || true
+            bosh_remove_rollback_file "$rollback_file" || true
+            return 1
+        }
+        current_hash="${current_hash%% *}"
+
+        if [[ "$current_hash" != "$initial_destination_hash" ]]; then
+            bosh_remove_temp_file "$temp_file" || true
+            bosh_remove_rollback_file "$rollback_file" || true
+            msg error "Destination changed during installation."
+            return 1
+        fi
+
+        if ! mv -fT -- "$temp_file" "$destination"; then
+            bosh_remove_temp_file "$temp_file" || true
+            bosh_remove_rollback_file "$rollback_file" || true
+            return 1
+        fi
+
+        bosh_forget_temp "$temp_file"
+    else
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "Destination appeared during installation."
+            return 1
+        fi
+
+        if ! mv -nT -- "$temp_file" "$destination"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+
+        if [[ -e "$temp_file" || -L "$temp_file" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "Existing destination preserved: $destination"
+            return 1
+        fi
+
+        bosh_forget_temp "$temp_file"
+    fi
+
+    file_hash="$(sha256sum -- "$destination")" || {
+        if [[ -n "$rollback_file" ]]; then
+            bosh_restore_rollback_file \
+                "$rollback_file" "$destination" \
+                "$source_hash" "$initial_destination_hash" ||
+                msg error "Rollback recovery needs attention; snapshot path: $rollback_file"
+        else
+            msg warning "Could not verify installed file; destination preserved: $destination"
+        fi
+        return 1
+    }
+    file_hash="${file_hash%% *}"
+
+    if [[ "$file_hash" != "$source_hash" ]]; then
+        if [[ -n "$rollback_file" ]]; then
+            bosh_restore_rollback_file \
+                "$rollback_file" "$destination" \
+                "$source_hash" "$initial_destination_hash" ||
+                msg error "Rollback recovery needs attention; snapshot path: $rollback_file"
+        else
+            msg warning "Unexpected file content; destination preserved: $destination"
+        fi
+
+        msg error "Installed file hash does not match its source."
+        return 1
+    fi
+
+    if [[ "$backup_path_b64" == "-" ]]; then
+        original_mode="-"
+    fi
+
+    manifest_fields=(
+        sha256 "$file_hash"
+        preexisting "$existed_before"
+        destination_b64 "$destination_b64"
+        backup_path_b64 "$backup_path_b64"
+        backup_sha256 "$backup_hash"
+    )
+
+    # Keep the old schema when an existing backup has no recoverable mode.
+    if [[ -n "$original_mode" ]]; then
+        manifest_fields+=(original_mode "$original_mode")
+    fi
+
+    if ! write_manifest "$state_key" managed_file "${manifest_fields[@]}"; then
+
+        if [[ -n "$rollback_file" ]]; then
+            bosh_restore_rollback_file \
+                "$rollback_file" "$destination" \
+                "$file_hash" "$initial_destination_hash" ||
+                msg error "Rollback recovery needs attention; snapshot path: $rollback_file"
+        else
+            bosh_remove_file_if_hash_matches "$destination" "$file_hash" || true
+        fi
+
+        msg error "Could not register the managed file."
+        return 1
+    fi
+
+    [[ -z "$rollback_file" ]] || bosh_remove_rollback_file "$rollback_file" || true
+
+    if (( existed_before )); then
+        msg success "Updated: $destination"
+    else
+        msg success "Installed: $destination"
+    fi
+}
+
+# Preserve user-modified files without aborting the whole installation.
+# install_managed_file returns 2 only for this intentional skip.
+install_managed_file_or_skip() {
+    local status=0
+
+    if install_managed_file "$@"; then
+        return 0
+    else
+        status=$?
+    fi
+
+    if (( status == 2 )); then
+        return 0
+    fi
+
+    return "$status"
+}
+
+# ------------------------------------------------------------
+# Install anime images without overwriting personal files
+# ------------------------------------------------------------
+
+install_anime_images() {
+    local source_file filename destination_file
+    local name_hash state_key manifest_file
+    local filename_b64 source_hash current_hash previous_hash
+    local legacy_key legacy_state_file legacy_value
+    local candidate candidate_filename candidate_key
+    local legacy_matches
+    local file_hash temp_file rollback_file manifest_value
+    local manifest_owned
+    local -a source_files=()
+    local -a manifest_lines=()
+
+    ensure_directory "$ANIME_DEST" || return 1
+    ensure_directory "$BOSH_STATE" || return 1
+
+    source_files=("$ANIME_SOURCE"/*.png)
+
+    if (( ${#source_files[@]} == 0 )); then
+        msg error "No anime PNG images found."
+        return 1
+    fi
+
+    for source_file in "${source_files[@]}"; do
+        if [[ -L "$source_file" || ! -f "$source_file" ]]; then
+            msg error "Invalid anime asset: $source_file"
+            return 1
+        fi
+
+        filename="${source_file##*/}"
+        destination_file="$ANIME_DEST/$filename"
+
+        name_hash="$(printf '%s' "$filename" | sha256sum)" || return 1
+        name_hash="${name_hash%% *}"
+        state_key="anime_${name_hash}"
+        manifest_file="$BOSH_STATE/$state_key"
+
+        filename_b64="$(printf '%s' "$filename" | base64 -w 0)" || return 1
+
+        source_hash="$(sha256sum -- "$source_file")" || return 1
+        source_hash="${source_hash%% *}"
+
+        if [[ -L "$manifest_file" ]]; then
+            msg error "Refusing to read a symbolic link: $manifest_file"
+            return 1
+        fi
+
+        if [[ -e "$manifest_file" && ! -f "$manifest_file" ]]; then
+            msg error "Anime manifest is not a regular file: $manifest_file"
+            return 1
+        fi
+
+        manifest_owned=0
+        previous_hash=""
+
+        # Read the current versioned manifest, if present.
+        if [[ -f "$manifest_file" ]]; then
+            if ! mapfile -t manifest_lines < "$manifest_file"; then
+                msg error "Could not read anime manifest: $filename"
+                return 1
+            fi
+
+            if (( ${#manifest_lines[@]} != 4 )) ||
+               [[ "${manifest_lines[0]}" != "version=1" ||
+                  "${manifest_lines[1]}" != "component=anime_image" ||
+                  "${manifest_lines[2]}" != "filename_b64=$filename_b64" ||
+                  ! "${manifest_lines[3]}" =~ ^sha256=[a-f0-9]{64}$ ]]; then
+                msg error "Anime manifest is invalid or belongs to another filename: $filename"
+                return 1
+            fi
+
+            previous_hash="${manifest_lines[3]#sha256=}"
+            manifest_owned=1
+        else
+            # Attempt legacy migration only when the old key is unambiguous.
+            legacy_key="anime_${filename//./_}"
+            legacy_state_file="$BOSH_STATE/$legacy_key"
+
+            if [[ "$legacy_key" =~ ^[a-zA-Z0-9_-]+$ ]] &&
+               [[ -e "$legacy_state_file" || -L "$legacy_state_file" ]]; then
+
+                if [[ -L "$legacy_state_file" ]]; then
+                    msg warning "Legacy anime state is a symbolic link; preserved: $legacy_key"
+                elif [[ -f "$legacy_state_file" &&
+                        -f "$destination_file" && ! -L "$destination_file" ]]; then
+
+                    legacy_matches=0
+
+                    for candidate in "${source_files[@]}"; do
+                        candidate_filename="${candidate##*/}"
+                        candidate_key="anime_${candidate_filename//./_}"
+
+                        if [[ "$candidate_key" == "$legacy_key" ]]; then
+                            legacy_matches=$((legacy_matches + 1))
+                        fi
+                    done
+
+                    legacy_value="$(cat -- "$legacy_state_file")" || return 1
+                    current_hash="$(sha256sum -- "$destination_file")" || return 1
+                    current_hash="${current_hash%% *}"
+
+                    if (( legacy_matches == 1 )) &&
+                       { [[ "$legacy_value" == "1" ]] && cmp -s "$source_file" "$destination_file" ||
+                         [[ "$legacy_value" =~ ^[a-f0-9]{64}$ && "$legacy_value" == "$current_hash" ]]; }; then
+
+                        printf -v manifest_value '%s\n%s\n%s\n%s' \
+                            "version=1" \
+                            "component=anime_image" \
+                            "filename_b64=$filename_b64" \
+                            "sha256=$current_hash"
+
+                        write_state "$state_key" "$manifest_value" || return 1
+                        previous_hash="$current_hash"
+                        manifest_owned=1
+
+                        msg info "Legacy anime ownership migrated: $filename"
+                    else
+                        msg warning "Ambiguous or unverifiable legacy anime state preserved: $legacy_key"
+                    fi
+                fi
+            fi
+        fi
+
+        # Existing managed files may be updated only if their content
+        # still matches the previously recorded hash.
+        if (( manifest_owned )); then
+            if [[ -L "$destination_file" ]]; then
+                msg warning "Managed anime destination became a symbolic link; preserved: $filename"
+                continue
+            fi
+
+            if [[ -e "$destination_file" && ! -f "$destination_file" ]]; then
+                msg warning "Managed anime destination is not a regular file; preserved: $filename"
+                continue
+            fi
+
+            if [[ -f "$destination_file" ]]; then
+                current_hash="$(sha256sum -- "$destination_file")" || return 1
+                current_hash="${current_hash%% *}"
+
+                if [[ "$current_hash" != "$previous_hash" ]]; then
+                    msg warning "Anime image was modified outside Bosh Terminal; preserved: $filename"
+                    continue
+                fi
+
+                if [[ "$current_hash" == "$source_hash" ]]; then
+                    msg info "Anime image already installed: $filename"
+                    continue
+                fi
+            fi
+        else
+            # An existing image without verified ownership is personal.
+            if [[ -e "$destination_file" || -L "$destination_file" ]]; then
+                if [[ -f "$destination_file" && ! -L "$destination_file" ]] &&
+                   cmp -s "$source_file" "$destination_file"; then
+                    msg info "Existing anime image preserved (not managed): $filename"
+                else
+                    msg warning "Personal image preserved: $filename"
+                fi
+                continue
+            fi
+        fi
+
+        # Prepare the new image in the destination filesystem.
+        temp_file="$(mktemp "${destination_file}.bosh-tmp.XXXXXX")" || return 1
+
+        bosh_register_temp "$temp_file" file || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+
+        if ! cp -p -- "$source_file" "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+
+        rollback_file=""
+
+        if (( manifest_owned )) && [[ -f "$destination_file" ]]; then
+            rollback_file="$(mktemp "${destination_file}.bosh-rollback.XXXXXX")" || {
+                bosh_remove_temp_file "$temp_file"
+                return 1
+            }
+
+            if ! cp -p -- "$destination_file" "$rollback_file"; then
+                bosh_remove_temp_file "$temp_file" || true
+                bosh_remove_rollback_file "$rollback_file" || true
+                return 1
+            fi
+
+            if ! bosh_verify_rollback_file "$rollback_file" "$previous_hash"; then
+                bosh_remove_temp_file "$temp_file" || true
+                msg error "Anime rollback snapshot verification failed; preserved: $rollback_file"
+                return 1
+            fi
+
+            current_hash="$(sha256sum -- "$destination_file")" || {
+                bosh_remove_temp_file "$temp_file" || true
+                bosh_remove_rollback_file "$rollback_file" || true
+                return 1
+            }
+            current_hash="${current_hash%% *}"
+
+            if [[ "$current_hash" != "$previous_hash" ]]; then
+                bosh_remove_temp_file "$temp_file" || true
+                bosh_remove_rollback_file "$rollback_file" || true
+                msg warning "Anime image changed during update; preserved: $filename"
+                continue
+            fi
+
+            if ! mv -fT -- "$temp_file" "$destination_file"; then
+                bosh_remove_temp_file "$temp_file" || true
+                bosh_remove_rollback_file "$rollback_file" || true
+                return 1
+            fi
+
+            bosh_forget_temp "$temp_file"
+        else
+            if [[ -e "$destination_file" || -L "$destination_file" ]]; then
+                bosh_remove_temp_file "$temp_file"
+                msg warning "Existing destination preserved: $filename"
+                continue
+            fi
+
+            if ! mv -nT -- "$temp_file" "$destination_file"; then
+                bosh_remove_temp_file "$temp_file"
+                return 1
+            fi
+
+            if [[ -e "$temp_file" || -L "$temp_file" ]]; then
+                bosh_remove_temp_file "$temp_file"
+                msg warning "Destination appeared during installation; preserved: $filename"
+                continue
+            fi
+
+            bosh_forget_temp "$temp_file"
+        fi
+
+        file_hash="$(sha256sum -- "$destination_file")" || {
+            if [[ -n "$rollback_file" ]]; then
+                bosh_restore_rollback_file \
+                    "$rollback_file" "$destination_file" \
+                    "$source_hash" "$previous_hash" ||
+                    msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
+            else
+                msg warning "Could not verify anime image; destination preserved: $destination_file"
+            fi
+            return 1
+        }
+        file_hash="${file_hash%% *}"
+
+        if [[ "$file_hash" != "$source_hash" ]]; then
+            if [[ -n "$rollback_file" ]]; then
+                bosh_restore_rollback_file \
+                    "$rollback_file" "$destination_file" \
+                    "$source_hash" "$previous_hash" ||
+                    msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
+            else
+                msg warning "Unexpected anime image content; destination preserved: $destination_file"
+            fi
+
+            msg error "Installed anime image hash does not match: $filename"
+            return 1
+        fi
+
+        printf -v manifest_value '%s\n%s\n%s\n%s' \
+            "version=1" \
+            "component=anime_image" \
+            "filename_b64=$filename_b64" \
+            "sha256=$file_hash"
+
+        if ! write_state "$state_key" "$manifest_value"; then
+            if [[ -n "$rollback_file" ]]; then
+                bosh_restore_rollback_file \
+                    "$rollback_file" "$destination_file" \
+                    "$file_hash" "$previous_hash" ||
+                    msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
+            else
+                bosh_remove_file_if_hash_matches "$destination_file" "$file_hash" || true
+            fi
+
+            msg error "Could not register anime image: $filename"
+            return 1
+        fi
+
+        [[ -z "$rollback_file" ]] || bosh_remove_rollback_file "$rollback_file" || true
+
+        msg success "Installed or updated anime image: $filename"
+    done
+}
+# Validate and migrate an existing positional Zsh integration manifest.
+migrate_zsh_manifest() {
+    local zshrc="$HOME/.zshrc"
+    local manifest_file="$BOSH_STATE/zshrc_manifest"
+    local start_marker="${1:-}"
+    local end_marker="${2:-}"
+    local source_line="${3:-}"
+    local source_command="${4:-}"
+    local mode=""
+    local actual_hash=""
+    local expected_block_hash=""
+    local actual_block_hash=""
+    local backup_path=""
+    local backup_path_b64="-"
+    local backup_hash="-"
+    local original_mode=""
+    local canonical_b64=""
+    local versioned=0
+    local -a legacy=()
+    local -a decoded_values=()
+
+    if [[ -L "$BOSH_STATE" ||
+          ( -e "$BOSH_STATE" && ! -d "$BOSH_STATE" ) ||
+          -L "$manifest_file" ||
+          ( -e "$manifest_file" && ! -f "$manifest_file" ) ]]; then
+        msg error "Zsh state path or record is not safe."
+        return 1
+    fi
+
+    if [[ -L "$zshrc" || ! -f "$zshrc" ]]; then
+        msg error "Cannot verify Zsh integration without a regular .zshrc."
+        return 1
+    fi
+
+    if [[ -z "$start_marker" || -z "$end_marker" ||
+          -z "$source_line" || -z "$source_command" ]]; then
+        msg error "Missing Zsh block validation parameters."
+        return 1
+    fi
+
+    if [[ "$(grep -Fxc -- "$start_marker" "$zshrc" || true)" != "1" ||
+          "$(grep -Fxc -- "$end_marker" "$zshrc" || true)" != "1" ]]; then
+        msg error "Zsh block markers are incomplete or duplicated."
+        return 1
+    fi
+
+    expected_block_hash="$(
+        printf '%s\n' \
+            "$start_marker" \
+            "$source_line" \
+            "$source_command" \
+            "$end_marker" | sha256sum
+    )" || return 1
+    expected_block_hash="${expected_block_hash%% *}"
+
+    actual_block_hash="$(
+        awk -v start="$start_marker" -v end="$end_marker" '
+            $0 == start {
+                if (seen_start) {
+                    invalid=1
+                    exit
+                }
+                seen_start=1
+                inside=1
+            }
+            inside {
+                print
+            }
+            $0 == end && inside {
+                seen_end=1
+                inside=0
+                exit
+            }
+            END {
+                if (invalid || !seen_start || !seen_end || inside) {
+                    exit 1
+                }
+            }
+        ' "$zshrc" | sha256sum
+    )" || {
+        msg error "Could not extract the Bosh block from .zshrc."
+        return 1
+    }
+    actual_block_hash="${actual_block_hash%% *}"
+
+    if [[ ! -e "$manifest_file" && ! -L "$manifest_file" ]]; then
+        if [[ "$actual_block_hash" != "$expected_block_hash" ]]; then
+            msg warning "The Bosh block in $HOME/.zshrc was edited; leaving it untouched."
+        else
+            msg info "Bosh Terminal block content verified; no manifest exists."
+        fi
+        return 0
+    fi
+
+    mapfile -t legacy < "$manifest_file" || return 1
+
+    if [[ "${legacy[0]:-}" == "version=1" ]]; then
+        read_manifest zshrc || return 1
+
+        if (( ${#BOSH_MANIFEST[@]} != 6 &&
+              ${#BOSH_MANIFEST[@]} != 7 )) ||
+           [[ "${BOSH_MANIFEST[component]:-}" != "zsh_integration" ||
+              ! "${BOSH_MANIFEST[mode]:-}" =~ ^(created|appended|legacy_replaced)$ ]]; then
+            msg error "Versioned Zsh manifest has an invalid schema."
+            return 1
+        fi
+
+        mode="${BOSH_MANIFEST[mode]}"
+        backup_path_b64="${BOSH_MANIFEST[backup_path_b64]:-}"
+        backup_hash="${BOSH_MANIFEST[backup_sha256]:-}"
+
+        if (( ${#BOSH_MANIFEST[@]} == 7 )); then
+            original_mode="${BOSH_MANIFEST[original_mode]:-}"
+
+            if [[ "$backup_path_b64" == "-" ]]; then
+                if [[ "$original_mode" != "-" ]]; then
+                    msg error "Versioned Zsh original mode metadata is inconsistent."
+                    return 1
+                fi
+            elif [[ ! "$original_mode" =~ ^[0-7]{3,4}$ ]]; then
+                msg error "Versioned Zsh original mode is invalid."
+                return 1
+            fi
+        else
+            # Previous schema did not record the original permissions.
+            original_mode=""
+        fi
+
+        if [[ -n "${BOSH_MANIFEST[block_sha256]+present}" &&
+              -z "${BOSH_MANIFEST[sha256]+present}" ]]; then
+
+            if [[ ! "${BOSH_MANIFEST[block_sha256]}" =~ ^[a-f0-9]{64}$ ]]; then
+                msg error "Invalid Bosh block hash in Zsh manifest."
+                return 1
+            fi
+
+            expected_block_hash="${BOSH_MANIFEST[block_sha256]}"
+            versioned=1
+
+        elif [[ -n "${BOSH_MANIFEST[sha256]+present}" &&
+                -z "${BOSH_MANIFEST[block_sha256]+present}" ]]; then
+
+            # Previous schema stored the hash of the entire .zshrc.
+            # That hash cannot validate a file with user-owned additions.
+            if [[ ! "${BOSH_MANIFEST[sha256]}" =~ ^[a-f0-9]{64}$ ]]; then
+                msg error "Invalid legacy Zsh file hash."
+                return 1
+            fi
+
+        else
+            msg error "Zsh manifest has an ambiguous hash schema."
+            return 1
+        fi
+
+        if [[ "$backup_path_b64" == "-" ]]; then
+            if [[ "$mode" != "created" || "$backup_hash" != "-" ]]; then
+                msg error "Versioned Zsh backup metadata is inconsistent."
+                return 1
+            fi
+        else
+            if [[ "$mode" == "created" ||
+                  ! "$backup_path_b64" =~ ^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$ ||
+                  ! "$backup_hash" =~ ^[a-f0-9]{64}$ ]]; then
+                msg error "Versioned Zsh backup metadata is invalid."
+                return 1
+            fi
+
+            decoded_values=()
+            mapfile -d '' -t decoded_values < <(
+                printf '%s' "$backup_path_b64" | base64 --decode 2>/dev/null
+            )
+
+            if (( ${#decoded_values[@]} != 1 )); then
+                msg error "Could not decode the Zsh backup path."
+                return 1
+            fi
+
+            backup_path="${decoded_values[0]}"
+            canonical_b64="$(printf '%s' "$backup_path" | base64 -w 0)" || return 1
+
+            if [[ "$canonical_b64" != "$backup_path_b64" ||
+                  "$backup_path" != /* ||
+                  -L "$backup_path" || ! -f "$backup_path" ]]; then
+                msg error "Zsh backup file is missing or invalid."
+                return 1
+            fi
+
+            actual_hash="$(sha256sum -- "$backup_path")" || return 1
+            actual_hash="${actual_hash%% *}"
+
+            if [[ "$actual_hash" != "$backup_hash" ]]; then
+                msg error "Zsh backup hash does not match its manifest."
+                return 1
+            fi
+        fi
+
+    else
+        # Positional legacy manifest.
+        if (( ${#legacy[@]} != 4 )) ||
+           [[ ! "${legacy[0]:-}" =~ ^(created|appended|legacy_replaced)$ ||
+              ! "${legacy[1]:-}" =~ ^[a-f0-9]{64}$ ]]; then
+            msg error "Legacy Zsh manifest is invalid; preserving it."
+            return 1
+        fi
+
+        mode="${legacy[0]}"
+        backup_path="${legacy[2]}"
+        backup_hash="${legacy[3]}"
+        backup_path_b64="-"
+
+        if [[ "$backup_path" == "-" ]]; then
+            if [[ "$mode" != "created" || "$backup_hash" != "-" ]]; then
+                msg error "Legacy Zsh backup metadata is inconsistent."
+                return 1
+            fi
+        else
+            if [[ "$mode" == "created" || "$backup_path" != /* ||
+                  -L "$backup_path" || ! -f "$backup_path" ||
+                  ! "$backup_hash" =~ ^[a-f0-9]{64}$ ]]; then
+                msg error "Legacy Zsh backup is missing or invalid."
+                return 1
+            fi
+
+            actual_hash="$(sha256sum -- "$backup_path")" || return 1
+            actual_hash="${actual_hash%% *}"
+
+            if [[ "$actual_hash" != "$backup_hash" ]]; then
+                msg error "Legacy Zsh backup hash does not match."
+                return 1
+            fi
+
+            backup_path_b64="$(printf '%s' "$backup_path" | base64 -w 0)" || return 1
+        fi
+    fi
+
+    if [[ "$actual_block_hash" != "$expected_block_hash" ]]; then
+        msg warning "The Bosh block in $HOME/.zshrc was edited; leaving it untouched."
+    else
+        msg info "Bosh Terminal block integrity verified."
+    fi
+
+    if (( versioned )); then
+        return 0
+    fi
+
+    write_manifest zshrc zsh_integration \
+        mode "$mode" \
+        block_sha256 "$expected_block_hash" \
+        backup_path_b64 "$backup_path_b64" \
+        backup_sha256 "$backup_hash" || {
+        msg error "Could not migrate the legacy Zsh manifest."
+        return 1
+    }
+
+    msg success "Legacy Zsh manifest migrated to block-based integrity."
+}
+# Integrate Bosh Terminal with .zshrc
+# ------------------------------------------------------------
+
+integrate_zsh() {
+    local zshrc="$HOME/.zshrc"
+    local start_marker="# >>> Bosh Terminal >>>"
+    local end_marker="# <<< Bosh Terminal <<<"
+    # shellcheck disable=SC2016
+   local source_line='export BOSH_CONFIG_DIR="${BOSH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/bosh-terminal}"'
+    # shellcheck disable=SC2016
+   local source_command='source "$BOSH_CONFIG_DIR/zshrc"'
+    local manifest_file="$BOSH_STATE/zshrc_manifest"
+    local start_count=0
+    local end_count=0
+   local mode=""
+    local original_hash=""
+    local current_hash=""
+    local backup_path=""
+    local backup_record="-"
+    local backup_hash="-"
+    local temp_file=""
+    local block_hash=""
+    local backup_path_b64=""
+    local current_umask=""
+    local created_mode=""
+    local original_mode="-"
+
+    if [[ -L "$zshrc" ]]; then
+        msg error "Refusing to modify a symbolic link at $HOME/.zshrc."
+        return 1
+    fi
+
+    if [[ -e "$zshrc" && ! -f "$zshrc" ]]; then
+        msg error "$HOME/.zshrc exists but is not a regular file."
+        return 1
+    fi
+
+    if [[ -f "$zshrc" ]]; then
+        start_count="$(grep -Fxc -- "$start_marker" "$zshrc" || true)"
+        end_count="$(grep -Fxc -- "$end_marker" "$zshrc" || true)"
+
+        if (( start_count > 0 || end_count > 0 )); then
+            if (( start_count != 1 || end_count != 1 )); then
+                msg error "Incomplete or duplicated Bosh Terminal block."
+                return 1
+            fi
+
+            migrate_zsh_manifest \
+                "$start_marker" \
+                "$end_marker" \
+                "$source_line" \
+                "$source_command" || return 1
+
+            msg info "Bosh Terminal block already exists."
+            return 0
+        fi
+
+        original_hash="$(sha256sum -- "$zshrc")" || return 1
+        original_hash="${original_hash%% *}"
+
+        if grep -Eq 'fastfetch --chafa auto --logo|Bosh Terminal - Zsh' "$zshrc"; then
+            msg warning "A previous Bosh configuration was detected."
+
+            confirm \
+                "¿Reemplazar $HOME/.zshrc por el cargador de Bosh? Se creará una copia completa de respaldo." \
+                "Replace $HOME/.zshrc with the Bosh loader? A complete backup will be created." || return 1
+
+            mode="legacy_replaced"
+        else
+            mode="appended"
+        fi
+    else
+        mode="created"
+    fi
+
+    if [[ -e "$manifest_file" || -L "$manifest_file" ]]; then
+        msg warning "Found an orphaned Zsh integration state record; archiving it before re-integration."
+        archive_state "zshrc_manifest" || return 1
+    fi
+
+    if [[ "$mode" != "created" ]]; then
+        create_backup "$zshrc" || return 1
+        backup_path="$BOSH_LAST_BACKUP"
+        original_mode="$BOSH_LAST_BACKUP_MODE"
+
+        if [[ ! "$original_mode" =~ ^[0-7]{3,4}$ ]]; then
+            msg error "Could not capture the original .zshrc permissions."
+            return 1
+        fi
+
+        if [[ -z "$backup_path" || -L "$backup_path" || ! -f "$backup_path" ]]; then
+            msg error "The original Zsh backup could not be verified."
+            return 1
+        fi
+        backup_record="$backup_path"
+        backup_hash="$(sha256sum -- "$backup_path")" || return 1
+        backup_hash="${backup_hash%% *}"
+    fi
+
+    temp_file="$(mktemp "$HOME/.zshrc.bosh-tmp.XXXXXX")" || return 1
+
+    bosh_register_temp "$temp_file" file || {
+        bosh_remove_temp_file "$temp_file"
+        return 1
+    }
+
+    if [[ "$mode" == "appended" || "$mode" == "legacy_replaced" ]]; then
+        if ! cp -a -- "$zshrc" "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+    fi
+
+    if [[ "$mode" == "legacy_replaced" ]]; then
+        if ! : > "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+    fi
+
+    if [[ "$mode" == "appended" && -s "$zshrc" ]]; then
+        if ! printf '\n' >> "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        fi
+    fi
+
+    if ! printf '%s\n' \
+        "$start_marker" \
+        "$source_line" \
+        "$source_command" \
+        "$end_marker" >> "$temp_file"; then
+        bosh_remove_temp_file "$temp_file"
+        return 1
+    fi
+
+    if [[ "$mode" == "created" ]]; then
+        current_umask="$(umask)" || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+
+        if [[ ! "$current_umask" =~ ^[0-7]{3,4}$ ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "Could not determine the current umask."
+            return 1
+        fi
+
+        printf -v created_mode '%o' "$(( 0666 & ~(8#$current_umask) ))"
+
+        if ! chmod "$created_mode" "$temp_file"; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "Could not set the new .zshrc permissions."
+            return 1
+        fi
+    fi
+
+    block_hash="$(printf '%s\n' \
+        "$start_marker" \
+        "$source_line" \
+        "$source_command" \
+        "$end_marker" | sha256sum)" || {
+        bosh_remove_temp_file "$temp_file"
+        return 1
+    }
+    block_hash="${block_hash%% *}"
+
+    if [[ "$mode" != "created" ]]; then
+        if [[ -L "$zshrc" || ! -f "$zshrc" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "$HOME/.zshrc changed during installation."
+            return 1
+        fi
+
+        current_hash="$(sha256sum -- "$zshrc")" || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+        current_hash="${current_hash%% *}"
+
+        if [[ "$current_hash" != "$original_hash" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "$HOME/.zshrc changed during installation. Original preserved."
+            return 1
+        fi
+    else
+        if [[ -e "$zshrc" || -L "$zshrc" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            msg error "$HOME/.zshrc appeared during installation. Existing file preserved."
+            return 1
+        fi
+    fi
+
+    if [[ "$backup_record" == "-" ]]; then
+        backup_path_b64="-"
+    else
+        backup_path_b64="$(printf '%s' "$backup_record" | base64 -w 0)" || {
+            bosh_remove_temp_file "$temp_file"
+            return 1
+        }
+    fi
+
+    if ! write_manifest "zshrc" zsh_integration \
+        mode "$mode" \
+        block_sha256 "$block_hash" \
+        backup_path_b64 "$backup_path_b64" \
+        backup_sha256 "$backup_hash" \
+        original_mode "$original_mode"; then
+        bosh_remove_temp_file "$temp_file"
+        msg error "Could not register the Zsh integration."
+        return 1
+    fi
+
+    if [[ "$mode" == "created" ]]; then
+        if ! mv -nT -- "$temp_file" "$zshrc"; then
+            bosh_remove_temp_file "$temp_file"
+            rm -f -- "$manifest_file"
+            return 1
+        fi
+
+        if [[ -e "$temp_file" ]]; then
+            bosh_remove_temp_file "$temp_file"
+            rm -f -- "$manifest_file"
+            msg error "Another $HOME/.zshrc appeared. Existing file preserved."
+            return 1
+        fi
+
+        bosh_forget_temp "$temp_file"
+    else
+        if ! mv -fT -- "$temp_file" "$zshrc"; then
+            bosh_remove_temp_file "$temp_file"
+            rm -f -- "$manifest_file"
+            return 1
+        fi
+
+        bosh_forget_temp "$temp_file"
+    fi
+
+    msg success "Bosh Terminal integrated into $HOME/.zshrc."
+}
+# ------------------------------------------------------------
+# Main installation
+# ------------------------------------------------------------
+
+main() {
+    preflight || return 1
+
+    acquire_install_lock || return 1
+    setup_install_traps
+
+    install_dependencies || return 1
+    install_oh_my_zsh || return 1
+
+    install_managed_file_or_skip \
+        "$ZSH_CONFIG" \
+        "$BOSH_HOME/zshrc" "zsh_config" || return 1
+
+    install_managed_file_or_skip \
+        "$STARSHIP_CONFIG" \
+        "$BOSH_HOME/starship.toml" "starship" || return 1
+
+    install_managed_file_or_skip \
+        "$FASTFETCH_CONFIG" \
+        "$BOSH_HOME/fastfetch.jsonc" "fastfetch" || return 1
+
+    install_anime_images || return 1
+
+    integrate_zsh || return 1
+
+    install_konsole_component || return 1
+
+    msg success "Bosh Terminal installation completed."
+
+    say \
+        "Abre una nueva sesión de Zsh para utilizar Bosh Terminal." \
+        "Open a new Zsh session to use Bosh Terminal."
+
+    say \
+        "Selecciona el perfil 'bosh' en Konsole si instalaste el componente visual." \
+        "Select the 'bosh' profile in Konsole if you installed the visual component."
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
+\n'"${manifest_fields[manifest_index]}=${manifest_fields[manifest_index+1]}"
+    done
+
+    bosh_managed_txn_prepare \
+        "$state_key" "$destination" \
+        "${initial_destination_hash:--}" "$source_hash" \
+        "$pending_manifest" || return 1
 
     if (( destination_exists )); then
         rollback_file="$(mktemp "${destination}.bosh-rollback.XXXXXX")" || {
