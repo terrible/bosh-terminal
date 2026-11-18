@@ -933,16 +933,8 @@ install_managed_file() {
         "$pending_manifest" || return 1
 
     if (( destination_exists )); then
-        rollback_file="$(mktemp "${destination}.bosh-rollback.XXXXXX")" || {
-            bosh_remove_temp_file "$temp_file"
-            return 1
-        }
-
-        if ! cp -p -- "$destination" "$rollback_file"; then
-            bosh_remove_temp_file "$temp_file" || true
-            bosh_remove_rollback_file "$rollback_file" || true
-            return 1
-        fi
+        # Use the snapshot prepared inside the private persistent journal.
+        rollback_file="$BOSH_STATE/.${state_key}.managed-pending/previous_destination"
 
         if ! bosh_verify_rollback_file "$rollback_file" "$initial_destination_hash"; then
             bosh_remove_temp_file "$temp_file" || true
