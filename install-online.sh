@@ -19,7 +19,9 @@ fi
 for command in git mktemp rm bash; do
   command -v "$command" >/dev/null 2>&1 || die "Missing required command: $command"
 done
-[[ -r /dev/tty && -w /dev/tty ]] || die "An interactive terminal is required to review installation prompts."
+if ! ( : </dev/tty ) 2>/dev/null; then
+  die "An interactive terminal is required to review installation prompts."
+fi
 
 # Git's HTTPS certificate verification must remain enabled.
 export GIT_TERMINAL_PROMPT=0
