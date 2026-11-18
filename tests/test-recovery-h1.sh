@@ -288,4 +288,115 @@ fi
 [[ "$(cat "$BOSH_HOME/starship.toml")" == REPLACEMENT ]]
 CASE
 
+
+test_case "H1: interruption inside recovery after manifest commit is idempotent" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'PERSONAL\n' > "$BOSH_HOME/starship.toml"
+printf 'MANAGED\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    write_manifest() { exit 86; }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    bosh_managed_txn_finish() { exit 87; }
+    bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"
+' || status=$?
+[[ "$status" -eq 87 ]]
+[[ -d "$BOSH_STATE/.starship.managed-pending" ]]
+[[ -f "$BOSH_STATE/starship_manifest" ]]
+bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"
+bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"
+[[ ! -e "$BOSH_STATE/.starship.managed-pending" ]]
+read_manifest starship
+[[ "${BOSH_MANIFEST[backup_path_b64]}" != '-' ]]
+[[ "$(cat "$BOSH_HOME/starship.toml")" == MANAGED ]]
+CASE
+
+test_case "H1: interrupted cleanup of completed journal is resumed" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'PERSONAL\n' > "$BOSH_HOME/starship.toml"
+printf 'MANAGED\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    rm() {
+        if [[ "$*" == *".starship.managed-completed."* ]]; then exit 87; fi
+        command rm "$@"
+    }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 87 ]]
+[[ -f "$BOSH_STATE/starship_manifest" ]]
+[[ ! -e "$BOSH_STATE/.starship.managed-pending" ]]
+compgen -G "$BOSH_STATE/.starship.managed-completed.*" >/dev/null
+
+bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"
+if compgen -G "$BOSH_STATE/.starship.managed-completed.*" >/dev/null; then
+    echo "ERROR: completed journal still present after recovery"
+    exit 1
+fi
+read_manifest starship
+[[ "${BOSH_MANIFEST[backup_path_b64]}" != '-' ]]
+[[ "$(cat "$BOSH_HOME/starship.toml")" == MANAGED ]]
+CASE
+
+test_case "H1: foreign entry in completed journal blocks cleanup" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'PERSONAL\n' > "$BOSH_HOME/starship.toml"
+printf 'MANAGED\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    rm() {
+        if [[ "$*" == *".starship.managed-completed."* ]]; then exit 87; fi
+        command rm "$@"
+    }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 87 ]]
+completed=( "$BOSH_STATE"/.starship.managed-completed.* )
+[[ "${#completed[@]}" -eq 1 && -d "${completed[0]}" ]]
+printf 'USER-SENTINEL\n' > "${completed[0]}/unrecognized"
+if bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"; then
+    echo "ERROR: recovery accepted a foreign completed entry"
+    exit 1
+fi
+[[ "$(cat "${completed[0]}/unrecognized")" == USER-SENTINEL ]]
+[[ "$(cat "$BOSH_HOME/starship.toml")" == MANAGED ]]
+[[ -f "$BOSH_STATE/starship_manifest" ]]
+CASE
+
+test_case "H1: interrupted prepare directory is safely garbage collected" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'PERSONAL\n' > "$BOSH_HOME/starship.toml"
+printf 'MANAGED\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    mv() {
+        if [[ "${*: -1}" == */record ]]; then exit 86; fi
+        command mv "$@"
+    }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+compgen -G "$BOSH_STATE/.starship.managed-prepare.*" >/dev/null
+[[ "$(cat "$BOSH_HOME/starship.toml")" == PERSONAL ]]
+install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+if compgen -G "$BOSH_STATE/.starship.managed-prepare.*" >/dev/null; then
+    echo "ERROR: interrupted preparation left private residuals"
+    exit 1
+fi
+[[ "$(cat "$BOSH_HOME/starship.toml")" == MANAGED ]]
+CASE
+
 test_summary
