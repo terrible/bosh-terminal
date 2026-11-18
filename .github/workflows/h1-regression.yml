@@ -1,0 +1,30 @@
+name: H1 transaction recovery checks
+
+on:
+  push:
+    branches: [fix/h1-transaction-recovery]
+  pull_request:
+    branches: [fix/h2-test-isolation]
+
+permissions:
+  contents: read
+
+jobs:
+  recovery-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+      - name: Bash syntax
+        run: |
+          bash -n install.sh uninstall.sh scripts/lib/*.sh tests/*.sh
+      - name: ShellCheck
+        run: |
+          shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/lib/*.sh tests/*.sh
+      - name: Isolated regression suite
+        run: |
+          env -u BOSH_HOME -u BOSH_STATE -u BOSH_BACKUP bash tests/run-tests.sh
