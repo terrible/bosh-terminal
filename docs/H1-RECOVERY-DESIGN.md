@@ -1,6 +1,6 @@
 # H1 — Diseño de recuperación transaccional (propuesta)
 
-> Estado: **diseño pendiente de implementación y pruebas**.  
+> Estado: **diseño de referencia con implementación experimental y pruebas de caída de proceso en PR #4**. H1 sigue abierto.  
 > Seguimiento: [Issue #3](https://github.com/terrible/bosh-terminal/issues/3).  
 > Base de trabajo: `fix/h1-transaction-recovery` (derivada de `fix/h2-test-isolation`).  
 > No utilizar este documento como evidencia de que H1 esté corregido.
@@ -16,7 +16,7 @@ En una prueba con HOME temporal, interrumpir `write_manifest()` mediante `exit 8
 - Respaldo original existente.
 - Reintento que clasifica el candidato como preexistente e idéntico y registra `backup_path_b64=-`.
 
-La reproducción no simula todavía `SIGKILL` ni pérdida de energía.
+La reproducción inicial no incluía `SIGKILL`. Las regresiones del PR #4 sí incluyen `SIGKILL` y recuperación idempotente; **no** incluyen validación de pérdida de energía.
 
 ## Objetivo e invariantes
 
@@ -84,7 +84,19 @@ La restauración y la limpieza también deben ser idempotentes ante una segunda 
 9. `bash -n`, ShellCheck, suite completa y ejecución con variables `BOSH_*` externas y centinelas.
 10. Revisar por separado el mismo patrón `mv` + `write_state` de `install_anime_images()`; no declarar resuelta la consistencia de anime sin cubrirla.
 
-## Decisiones pendientes antes de implementar
+## Estado de implementación experimental — 2026-11-18
+
+El [PR #4](https://github.com/terrible/bosh-terminal/pull/4) implementa una primera versión para **archivos gestionados** (no anime ni Zsh) y el [informe adversarial](https://github.com/terrible/bosh-terminal/blob/fix/h1-transaction-recovery/docs/H1-ADVERSARIAL-AUDIT.md) documenta sus límites.
+
+- El diario se prepara primero en una carpeta privada `.managed-prepare.*` y se publica de manera atómica como `.managed-pending`, antes del renombrado del archivo de configuración.
+- Se conservan hashes del estado anterior y nuevo, copia privada del destino anterior, manifiestos y asociación con respaldos originales.
+- La implementación actual prioriza **completar hacia delante** una publicación válida cuando el destino ya coincide con el candidato; si el estado físico y el manifiesto son anteriores, cancela el diario. En situaciones ambiguas, aborta y conserva archivos. Esta política puede diferir de la restauración inmediata propuesta inicialmente para una publicación incompleta.
+- Tras un commit, los residuos de `.managed-completed.*` y de preparación son inspeccionados y retirados mediante borrado de archivos conocidos, verificación de UID, número de enlaces, ruta y tipo. El registro se elimina al final para permitir un nuevo intento.
+- La [ejecución CI 44399566717](https://github.com/terrible/bosh-terminal/actions/runs/44399566717) confirmó **19/19** regresiones H1 y **11/11** módulos de la suite completa, más Bash syntax y ShellCheck.
+
+**No se han implantado barreras de persistencia `fsync`** ni se ha certificado recuperación después de un corte de energía. La revisión de concurrencia, recuperación de estados manipulados y flujos independientes sigue pendiente.
+
+## Decisiones y revisiones todavía pendientes
 
 - Formato concreto del diario y validaciones del parser (con retrocompatibilidad de manifiestos v1 y legados).
 - Estrategia de durabilidad real en Arch Linux sin dependencias opcionales inseguras.
