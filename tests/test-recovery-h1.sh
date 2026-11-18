@@ -399,4 +399,87 @@ fi
 [[ "$(cat "$BOSH_HOME/starship.toml")" == MANAGED ]]
 CASE
 
+
+test_case "H1: SIGKILL in middle of completed cleanup is retryable" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'ORIGINAL\n' > "$BOSH_HOME/starship.toml"
+printf 'CANDIDATE\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    rm() {
+        if [[ "$*" == *".starship.managed-completed."*"/previous_destination" ]]; then
+            command rm "$@"
+            kill -KILL "$BASHPID"
+        fi
+        command rm "$@"
+    }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 137 ]]
+[[ -f "$BOSH_STATE/starship_manifest" ]]
+completed=( "$BOSH_STATE"/.starship.managed-completed.* )
+[[ "${#completed[@]}" -eq 1 && -d "${completed[0]}" ]]
+[[ ! -e "${completed[0]}/previous_destination" ]]
+[[ -f "${completed[0]}/record" ]]
+bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"
+[[ ! -e "${completed[0]}" ]]
+[[ "$(cat "$BOSH_HOME/starship.toml")" == CANDIDATE ]]
+CASE
+
+test_case "H1: symlink inside stale preparation is preserved" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'ORIGINAL\n' > "$BOSH_HOME/starship.toml"
+printf 'CANDIDATE\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    mv() {
+        if [[ "${*: -1}" == */record ]]; then exit 86; fi
+        command mv "$@"
+    }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+staging=( "$BOSH_STATE"/.starship.managed-prepare.* )
+[[ "${#staging[@]}" -eq 1 ]]
+printf 'SENTINEL\n' > "$HOME/external"
+ln -s "$HOME/external" "${staging[0]}/unexpected-link"
+if bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"; then
+    echo "ERROR: linked staging artifact was deleted"; exit 1
+fi
+[[ -L "${staging[0]}/unexpected-link" ]]
+[[ "$(cat "$HOME/external")" == SENTINEL ]]
+[[ "$(cat "$BOSH_HOME/starship.toml")" == ORIGINAL ]]
+CASE
+
+test_case "H1: hardlinked staging snapshot is never silently deleted" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'ORIGINAL\n' > "$BOSH_HOME/starship.toml"
+printf 'CANDIDATE\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    mv() {
+        if [[ "${*: -1}" == */record ]]; then exit 86; fi
+        command mv "$@"
+    }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+staging=( "$BOSH_STATE"/.starship.managed-prepare.* )
+[[ "${#staging[@]}" -eq 1 ]]
+ln "${staging[0]}/previous_destination" "$HOME/shared-link"
+if bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"; then
+    echo "ERROR: multiply-linked snapshot was removed"; exit 1
+fi
+[[ -f "$HOME/shared-link" ]]
+[[ "$(cat "$HOME/shared-link")" == ORIGINAL ]]
+[[ -f "${staging[0]}/previous_destination" ]]
+[[ "$(cat "$BOSH_HOME/starship.toml")" == ORIGINAL ]]
+CASE
+
 test_summary
