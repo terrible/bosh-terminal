@@ -70,7 +70,7 @@ bosh_managed_txn_prepare() {
     local key="$1" destination="$2" previous_hash="$3" next_hash="$4" payload="$5"
     local dir="$BOSH_STATE/.${key}.managed-pending"
     local manifest="$BOSH_STATE/${key}_manifest"
-    local old_manifest_hash='-' next_manifest_hash encoded
+    local old_manifest_hash='-' next_manifest_hash encoded stage=""
 
     [[ "$key" =~ ^[a-zA-Z0-9_-]+$ && "$destination" == /* ]] || return 1
     [[ "$next_hash" =~ ^[a-f0-9]{64}$ ]] || return 1
@@ -81,24 +81,26 @@ bosh_managed_txn_prepare() {
     [[ ! -e "$dir" && ! -L "$dir" ]] || return 1
     [[ ! -L "$manifest" && ( ! -e "$manifest" || -f "$manifest" ) ]] || return 1
 
-    (umask 077; mkdir -m 700 -- "$dir") || return 1
-    if ! (umask 077; printf '%s\n' "$payload" > "$dir/next"); then
+    # Prepare in a unique private directory: an interrupted preparation
+    # must not create the authoritative .managed-pending marker.
+    stage="$(mktemp -d "$BOSH_STATE/.${key}.managed-prepare.XXXXXXXX")" || return 1
+    if ! (umask 077; printf '%s\n' "$payload" > "$stage/next"); then
         return 1
     fi
-    bosh_managed_txn_validate_next "$dir/next" "$destination" "$next_hash" || return 1
-    next_manifest_hash="$(bosh_managed_txn_hash "$dir/next")" || return 1
+    bosh_managed_txn_validate_next "$stage/next" "$destination" "$next_hash" || return 1
+    next_manifest_hash="$(bosh_managed_txn_hash "$stage/next")" || return 1
 
     if [[ -f "$manifest" ]]; then
-        cp -p -- "$manifest" "$dir/previous" || return 1
-        chmod 600 -- "$dir/previous" || return 1
-        old_manifest_hash="$(bosh_managed_txn_hash "$dir/previous")" || return 1
+        cp -p -- "$manifest" "$stage/previous" || return 1
+        chmod 600 -- "$stage/previous" || return 1
+        old_manifest_hash="$(bosh_managed_txn_hash "$stage/previous")" || return 1
         [[ "$(bosh_managed_txn_hash "$manifest")" == "$old_manifest_hash" ]] || return 1
     fi
 
     # Keep the original destination snapshot inside the private journal.
     if [[ "$previous_hash" != '-' ]]; then
-        cp -p -- "$destination" "$dir/previous_destination" || return 1
-        [[ "$(bosh_managed_txn_hash "$dir/previous_destination")" == "$previous_hash" ]] || return 1
+        cp -p -- "$destination" "$stage/previous_destination" || return 1
+        [[ "$(bosh_managed_txn_hash "$stage/previous_destination")" == "$previous_hash" ]] || return 1
     fi
 
     encoded="$(printf '%s' "$destination" | base64 -w 0)" || return 1
@@ -108,10 +110,15 @@ bosh_managed_txn_prepare() {
         "previous_sha256=$previous_hash" \
         "next_sha256=$next_hash" \
         "previous_manifest_sha256=$old_manifest_hash" \
-        "next_manifest_sha256=$next_manifest_hash" > "$dir/record.tmp"); then
+        "next_manifest_sha256=$next_manifest_hash" > "$stage/record.tmp"); then
         return 1
     fi
-    mv -T -- "$dir/record.tmp" "$dir/record" || return 1
+    mv -T -- "$stage/record.tmp" "$stage/record" || return 1
+    # The directory rename is the point at which the transaction becomes
+    # visible to recovery. Never clobber a concurrently created journal.
+    [[ ! -e "$dir" && ! -L "$dir" ]] || return 1
+    mv -nT -- "$stage" "$dir" || return 1
+    [[ ! -e "$stage" && ! -L "$stage" ]] || return 1
 }
 
 bosh_managed_txn_finish() {
