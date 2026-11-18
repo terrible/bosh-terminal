@@ -7,6 +7,10 @@ Arch-based distributions. It manages the project's shell configuration,
 Starship prompt, Fastfetch display, anime artwork, and an optional Konsole
 profile and color scheme.
 
+## Preview
+
+![Bosh Terminal screenshot](docs/screenshots/bosht.png)
+
 ## Features
 
 - **Zsh:** shell configuration, completion support, and syntax highlighting.
