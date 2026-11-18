@@ -18,7 +18,7 @@
 
 **Regresión:** `H1: crash during journal preparation must not block next install`.
 
-**Límite:** una caída mientras se prepara puede dejar una carpeta de staging privada con snapshots. La limpieza automática, incluyendo comprobación de propiedad y resistencia a ataques de rutas, está pendiente. No debe hacerse `rm -rf` indiscriminado sobre esos directorios.
+**Seguimiento:** las carpetas de preparación incompleta ahora pueden retirarse de forma controlada mediante `bosh_managed_txn_collect()`. La limpieza comprueba identidad de ruta, propietario, modo privado, tipo de archivo, enlaces y nombres conocidos, y no usa `rm -rf`. Ante contenido ambiguo, conserva la carpeta y detiene el proceso. El análisis de concurrencia/TOCTOU sigue pendiente.
 
 ### A2 — Limpieza de entradas no reconocidas (corregido)
 
@@ -32,13 +32,25 @@
 
 Se corrigió una comparación literal defectuosa de `BOSH_MANIFEST[backup_path_b64]` en las pruebas. La nueva comparación usa expansión de la variable del manifiesto y verifica que no sea `-`.
 
+### A4 — Interrupción durante la propia recuperación (corregido para caída de proceso)
+
+**Observación:** una terminación después del commit de manifiesto, pero durante la eliminación del diario completado, dejaba copias persistentes bajo `.$key.managed-completed.*` que el siguiente instalador no recogía. Una preparación interrumpida también dejaba carpetas residuales.
+
+**Corrección:** `bosh_managed_txn_collect()` reanuda la limpieza bajo el bloqueo del instalador/desinstalador. Los diarios completados se reconcilian con los hashes del estado nuevo o previo antes de borrar solo entradas conocidas; el archivo `record` se retira **al final** para admitir una segunda interrupción. Las carpetas de preparación no publicadas se inspeccionan antes de limpiar. Se utiliza `rm -f` para archivos individuales y `rmdir` para directorios vacíos, nunca borrado recursivo indiscriminado.
+
+**Defensas:** se comprueban rutas con sufijos restringidos, UID del propietario, directorios modo `700`, archivos regulares sin symlink ni hardlink (`nlink=1`), contenido esperado y evidencia de estado del destino/manifiesto para residuos completados. Si falta `record` y quedan archivos, se detiene la limpieza.
+
+**Regresiones añadidas:** caída durante recuperación tras commit de manifiesto, residuos `completed` tras interrupción, entrada ajena en `completed`, limpieza de `prepare`, `SIGKILL` tras retirar el primer snapshot, symlink en staging y hardlink en staging.
+
+**Límites:** esta función requiere serialización mediante `flock`, que los puntos de entrada principales ya proporcionan. No elimina el riesgo de carreras con otros procesos del mismo UID ni proporciona durabilidad ante pérdida de energía.
+
 ## Evidencia automática
 
-[GitHub Actions: ejecución 44394703710](https://github.com/terrible/bosh-terminal/actions/runs/44394703710)
+[GitHub Actions: ejecución 44399566717](https://github.com/terrible/bosh-terminal/actions/runs/44399566717)
 
 | Comprobación | Resultado |
 | --- | --- |
-| H1: regresiones aisladas | **12/12 PASS** |
+| H1: regresiones aisladas | **19/19 PASS** |
 | Suite completa en contenedor Arch Linux | **11/11 módulos PASS** |
 | Sintaxis Bash | PASS |
 | ShellCheck | PASS |
@@ -49,10 +61,10 @@ Los escenarios H1 incluyen salida prematura, `SIGKILL` durante el registro de ma
 ## Riesgos y trabajo pendiente
 
 1. **Durabilidad ante corte de energía:** `mv` atómico no implica persistencia. Falta diseñar `fsync` para contenido y directorios, o limitar explícitamente el contrato de recuperación a fallas de proceso.
-2. **Residuos de staging y completed:** una interrupción puede dejar archivos privados `.managed-prepare.*` o `.managed-completed.*`. Se necesita un procedimiento idempotente y seguro de inspección/limpieza, con protección frente a symlinks y estados ambiguos.
-3. **Recuperación interrumpida:** ampliar las pruebas para cortes dentro de `bosh_managed_txn_recover()` y durante el retiro de diarios.
+2. **Residuos de staging y completed:** la recolección idempotente está implementada y probada, pero se requiere revisión independiente de carreras TOCTOU, escenarios de corrupción deliberada y estados históricos anteriores a esta corrección.
+3. **Recuperación interrumpida:** se cubren cortes después del commit y durante la limpieza, incluso `SIGKILL` a mitad de la eliminación. Falta ampliar puntos de corte, fallos de I/O y comprobaciones de durabilidad.
 4. **Concurrencia y TOCTOU:** verificar la cobertura de locking en todos los puntos de entrada; revisar cambios externos entre comprobación de hash y publicación.
-5. **Propiedad/identidad de rutas:** incorporar revisión de UID, padres simbólicos, rutas con traversal, hashes corruptos, formato de diario y permisos no canónicos; no basarse solo en permisos de modo.
+5. **Propiedad/identidad de rutas:** se añadieron controles de UID, rutas y número de enlaces en la limpieza. Persisten revisiones de validación estricta de todos los manifiestos, rutas con traversal, permisos no canónicos y sustituciones concurrentes.
 6. **Flujos independientes:** `install_anime_images()` y `integrate_zsh()` tienen protocolos de publicación diferentes; no se benefician automáticamente del diario de archivos gestionados.
 7. **Otros hallazgos de auditoría:** revisar la ejecución privilegiada de `uninstall.sh`, validaciones de padres y consistencia de desinstalación (separados de H1).
 
