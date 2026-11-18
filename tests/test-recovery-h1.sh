@@ -52,6 +52,11 @@ bash --noprofile --norc -euo pipefail -c '
 ' || status=$?
 [[ "$status" -eq 137 ]]
 [[ "$(cat "$destination")" == "NEW" && ! -e "$manifest" ]]
+[[ -f "$BOSH_STATE/.starship.managed-pending/previous_destination" ]]
+[[ "$(stat -c '%a' "$BOSH_STATE/.starship.managed-pending")" == 700 ]]
+if compgen -G "${destination}.bosh-rollback.*" >/dev/null; then
+    echo "ERROR: detached rollback snapshot leaked"; exit 1
+fi
 source "$BOSH_TEST_PROJECT/uninstall.sh"
 bosh_uninstall_process_managed_file starship
 [[ "$(cat "$destination")" == "ORIGINAL" ]]
@@ -139,6 +144,73 @@ bash --noprofile --norc -euo pipefail -c '
 bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"
 [[ ! -e "$BOSH_STATE/.starship.managed-pending" ]]
 [[ "$(cat "$BOSH_HOME/starship.toml")" == OLD ]]
+CASE
+
+
+test_case "H1: crash after manifest commit is idempotently finalized" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'ORIGINAL\n' > "$BOSH_HOME/starship.toml"
+printf 'CANDIDATE\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    bosh_managed_txn_finish() { exit 86; }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+[[ "$(cat "$BOSH_HOME/starship.toml")" == CANDIDATE ]]
+[[ -f "$BOSH_STATE/starship_manifest" ]]
+[[ -d "$BOSH_STATE/.starship.managed-pending" ]]
+bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"
+[[ ! -e "$BOSH_STATE/.starship.managed-pending" ]]
+read_manifest starship
+[[ "§{BOSH_MANIFEST[backup_path_b64]}" != '-' ]]
+CASE
+
+test_case "H1: wrong journal permissions prevent recovery" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'ORIGINAL\n' > "$BOSH_HOME/starship.toml"
+printf 'CANDIDATE\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    write_manifest() { exit 86; }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+pending="$BOSH_STATE/.starship.managed-pending"
+chmod 755 "$pending"
+if bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"; then
+    echo "ERROR: insecure journal accepted"; exit 1
+fi
+[[ "$(cat "$BOSH_HOME/starship.toml")" == CANDIDATE ]]
+[[ ! -e "$BOSH_STATE/starship_manifest" ]]
+[[ -d "$pending" ]]
+CASE
+
+test_case "H1: symlinked journal record cannot be trusted" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'ORIGINAL\n' > "$BOSH_HOME/starship.toml"
+printf 'CANDIDATE\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    write_manifest() { exit 86; }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+pending="$BOSH_STATE/.starship.managed-pending"
+mv -- "$pending/record" "$pending/record.saved"
+ln -s record.saved "$pending/record"
+if bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"; then
+    echo "ERROR: symlinked record accepted"; exit 1
+fi
+[[ -L "$pending/record" && -f "$pending/record.saved" ]]
+[[ "$(cat "$BOSH_HOME/starship.toml")" == CANDIDATE ]]
+[[ ! -e "$BOSH_STATE/starship_manifest" ]]
 CASE
 
 test_summary
