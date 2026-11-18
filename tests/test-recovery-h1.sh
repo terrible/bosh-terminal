@@ -165,7 +165,7 @@ bash --noprofile --norc -euo pipefail -c '
 bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"
 [[ ! -e "$BOSH_STATE/.starship.managed-pending" ]]
 read_manifest starship
-[[ "§{BOSH_MANIFEST[backup_path_b64]}" != '-' ]]
+[[ "${BOSH_MANIFEST[backup_path_b64]}" != '-' ]]
 CASE
 
 test_case "H1: wrong journal permissions prevent recovery" <<'CASE'
@@ -211,6 +211,57 @@ fi
 [[ -L "$pending/record" && -f "$pending/record.saved" ]]
 [[ "$(cat "$BOSH_HOME/starship.toml")" == CANDIDATE ]]
 [[ ! -e "$BOSH_STATE/starship_manifest" ]]
+CASE
+
+
+test_case "H1: crash during journal preparation must not block next install" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+destination="$BOSH_HOME/starship.toml"
+printf 'ORIGINAL\n' > "$destination"
+printf 'REPLACEMENT\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    mv() {
+        if [[ "${*: -1}" == */record ]]; then
+            exit 86
+        fi
+        command mv "$@"
+    }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+[[ "$(cat "$destination")" == ORIGINAL ]]
+[[ ! -e "$BOSH_STATE/starship_manifest" ]]
+[[ ! -e "$BOSH_STATE/.starship.managed-pending" ]]
+
+install_managed_file "$HOME/replacement" "$destination" starship
+read_manifest starship
+[[ "${BOSH_MANIFEST[preexisting]}" == 1 ]]
+[[ "${BOSH_MANIFEST[backup_path_b64]}" != '-' ]]
+[[ "$(cat "$destination")" == REPLACEMENT ]]
+CASE
+
+test_case "H1: corrupted candidate manifest remains quarantined" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'ORIGINAL\n' > "$BOSH_HOME/starship.toml"
+printf 'REPLACEMENT\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    write_manifest() { exit 86; }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+printf '\nUNTRUSTED\n' >> "$BOSH_STATE/.starship.managed-pending/next"
+if bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"; then
+    echo "ERROR: corrupt manifest accepted"; exit 1
+fi
+[[ "$(cat "$BOSH_HOME/starship.toml")" == REPLACEMENT ]]
+[[ ! -e "$BOSH_STATE/starship_manifest" ]]
+[[ -d "$BOSH_STATE/.starship.managed-pending" ]]
 CASE
 
 test_summary
