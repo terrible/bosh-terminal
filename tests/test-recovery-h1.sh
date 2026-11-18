@@ -264,4 +264,28 @@ fi
 [[ -d "$BOSH_STATE/.starship.managed-pending" ]]
 CASE
 
+
+test_case "H1: unexpected file inside journal must be preserved" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+mkdir -p "$BOSH_HOME"
+printf 'ORIGINAL\n' > "$BOSH_HOME/starship.toml"
+printf 'REPLACEMENT\n' > "$HOME/replacement"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    bosh_managed_txn_finish() { exit 86; }
+    install_managed_file "$HOME/replacement" "$BOSH_HOME/starship.toml" starship
+' || status=$?
+[[ "$status" -eq 86 ]]
+dir="$BOSH_STATE/.starship.managed-pending"
+[[ -d "$dir" ]]
+printf 'EXTERNAL-CONTENT\n' > "$dir/unexpected-file"
+if bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml"; then
+    echo "ERROR: a journal with unexpected entries was deleted"; exit 1
+fi
+[[ -f "$dir/unexpected-file" ]]
+[[ "$(cat "$dir/unexpected-file")" == EXTERNAL-CONTENT ]]
+[[ "$(cat "$BOSH_HOME/starship.toml")" == REPLACEMENT ]]
+CASE
+
 test_summary
