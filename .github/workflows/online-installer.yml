@@ -1,0 +1,75 @@
+name: Online installer security and integration
+
+on:
+  push:
+    branches: [feature/one-command-installer]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  offline-launcher:
+    name: Offline launcher / TTY / SHA / failure cases (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install verification tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck util-linux
+      - name: Bash syntax and ShellCheck
+        run: |
+          bash -n install-online.sh tests/test-install-online.sh tests/online-fixture.sh
+          shellcheck --norc -x -P SCRIPTDIR install-online.sh tests/test-install-online.sh tests/online-fixture.sh
+      - name: Test launcher without network or system installation
+        run: |
+          bash tests/test-install-online.sh
+
+  arch-integration:
+    name: Arch Linux disposable environment / root guard / full regression
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    timeout-minutes: 20
+    steps:
+      - name: Install test prerequisites only (inside throwaway container)
+        run: |
+          pacman -Syu --noconfirm --needed git shellcheck util-linux sudo diffutils
+      - uses: actions/checkout@v4
+      - name: Syntax and static audit
+        run: |
+          bash -n install.sh uninstall.sh install-online.sh scripts/lib/*.sh tests/*.sh
+          shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh install-online.sh scripts/lib/*.sh tests/*.sh
+      - name: Root invocation must refuse before changing files
+        run: |
+          if bash install-online.sh > /tmp/bosh-online-root-check.log 2>&1; then
+            echo "Root invocation was accepted"; exit 1
+          fi
+          grep -Fq 'Do not run this installer as root' /tmp/bosh-online-root-check.log
+      - name: Full Bosh regression as an unprivileged user
+        run: |
+          useradd -m -s /bin/bash bosh-ci
+          chown -R bosh-ci:bosh-ci "$GITHUB_WORKSPACE"
+          su -s /bin/bash bosh-ci -c "cd '$GITHUB_WORKSPACE' && env -u BOSH_HOME -u BOSH_STATE -u BOSH_BACKUP bash tests/run-tests.sh"
+
+  pinned-fetch-smoke:
+    name: Read-only GitHub pinned SHA fetch (no installer execution)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Confirm GitHub serves the immutable pinned commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          pinned="3fc14e53813bab8d31e16c57c716695549ab9d72"
+          workdir="$(mktemp -d)"
+          trap 'rm -rf -- "$workdir"' EXIT
+          git -C "$workdir" init -q
+          git -C "$workdir" remote add origin https://github.com/terrible/bosh-terminal.git
+          GIT_TERMINAL_PROMPT=0 git -C "$workdir" -c protocol.version=2 \
+            fetch --quiet --depth 1 origin "$pinned"
+          [[ "$(git -C "$workdir" rev-parse --verify 'FETCH_HEAD^{commit}')" == "$pinned" ]]
+          echo "Pinned Git SHA fetched and verified; no code executed."
