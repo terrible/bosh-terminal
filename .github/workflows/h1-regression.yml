@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  recovery-regression:
+  static-and-h1:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -25,6 +25,26 @@ jobs:
       - name: ShellCheck
         run: |
           shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/lib/*.sh tests/*.sh
-      - name: Isolated regression suite
+      - name: Targeted H1 regression (isolated HOME)
         run: |
-          env -u BOSH_HOME -u BOSH_STATE -u BOSH_BACKUP bash tests/run-tests.sh
+          bash tests/test-recovery-h1.sh
+
+  arch-full-suite:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    timeout-minutes: 20
+    steps:
+      - name: Install build and audit prerequisites
+        run: |
+          pacman -Syu --noconfirm --needed git shellcheck diffutils sudo
+      - uses: actions/checkout@v4
+      - name: Validate scripts
+        run: |
+          bash -n install.sh uninstall.sh scripts/lib/*.sh tests/*.sh
+          shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/lib/*.sh tests/*.sh
+      - name: Full regression as unprivileged user on Arch Linux
+        run: |
+          useradd -m -s /bin/bash bosh-ci
+          chown -R bosh-ci:bosh-ci "$GITHUB_WORKSPACE"
+          su -s /bin/bash bosh-ci -c "cd '$GITHUB_WORKSPACE' && env -u BOSH_HOME -u BOSH_STATE -u BOSH_BACKUP bash tests/run-tests.sh"
