@@ -66,6 +66,129 @@ bosh_managed_txn_validate_next() {
     fi
 }
 
+
+# Remove only private, regular, single-linked journal artifacts. An interrupted
+# cleanup may be retried. Never follow symlinks or recursively remove unknown
+# content, and do not touch pending transactions here.
+bosh_managed_txn_prune_dir() {
+    local key="$1" dir="$2" phase="$3" destination="$4"
+    local prefix suffix own_uid entry name manifest manifest_hash='-' dest_hash='-'
+    local prev_hash next_hash prev_manifest_hash next_manifest_hash encoded
+    local -a record=()
+    local entries=0
+
+    [[ "$key" =~ ^[a-zA-Z0-9_-]+$ && "$destination" == /* ]] || return 1
+    [[ "$phase" == prepare || "$phase" == completed ]] || return 1
+    prefix="$BOSH_STATE/.${key}.managed-${phase}."
+    [[ "$dir" == "$prefix"* ]] || return 1
+    suffix="${dir#"$prefix"}"
+    [[ "$suffix" =~ ^[A-Za-z0-9]{8}$ ]] || return 1
+
+    bosh_managed_txn_safe_directory "$BOSH_STATE" || return 1
+    bosh_managed_txn_safe_directory "$dir" || return 1
+    own_uid="$(id -u)" || return 1
+    [[ "$(stat -c '%u' -- "$dir")" == "$own_uid" &&
+       "$(stat -c '%a' -- "$dir")" == 700 ]] || return 1
+
+    # Scan before deleting anything. Unknown entries or symlinks fail closed.
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        name="${entry##*/}"
+        case "$name" in
+            record|next|previous|previous_destination) ;;
+            record.tmp)
+                [[ "$phase" == prepare ]] || return 1
+                ;;
+            *) msg error "Foreign journal entry preserved: $entry"; return 1 ;;
+        esac
+        [[ ! -L "$entry" && -f "$entry" ]] || return 1
+        [[ "$(stat -c '%u' -- "$entry")" == "$own_uid" ]] || return 1
+        [[ "$(stat -c '%h' -- "$entry")" == 1 ]] || return 1
+        entries=$((entries + 1))
+    done
+
+    # For a completed journal, prove that the system still matches the state
+    # in its record. The record is removed LAST so interrupted cleanup can be
+    # retried. An empty directory can arise before the pending rename.
+    if [[ "$phase" == completed && -f "$dir/record" ]]; then
+        mapfile -t record < "$dir/record" || return 1
+        (( ${#record[@]} == 6 )) || return 1
+        encoded="$(printf '%s' "$destination" | base64 -w 0)" || return 1
+        [[ "${record[0]}" == version=1 &&
+           "${record[1]}" == "destination_b64=$encoded" &&
+           "${record[2]}" == previous_sha256=* &&
+           "${record[3]}" == next_sha256=* &&
+           "${record[4]}" == previous_manifest_sha256=* &&
+           "${record[5]}" == next_manifest_sha256=* ]] || return 1
+        prev_hash="${record[2]#previous_sha256=}"
+        next_hash="${record[3]#next_sha256=}"
+        prev_manifest_hash="${record[4]#previous_manifest_sha256=}"
+        next_manifest_hash="${record[5]#next_manifest_sha256=}"
+        [[ ( "$prev_hash" == '-' || "$prev_hash" =~ ^[a-f0-9]{64}$ ) &&
+           "$next_hash" =~ ^[a-f0-9]{64}$ &&
+           ( "$prev_manifest_hash" == '-' || "$prev_manifest_hash" =~ ^[a-f0-9]{64}$ ) &&
+           "$next_manifest_hash" =~ ^[a-f0-9]{64}$ ]] || return 1
+
+        bosh_managed_txn_safe_directory "$(dirname -- "$destination")" || return 1
+        [[ ! -L "$destination" && ( ! -e "$destination" || -f "$destination" ) ]] || return 1
+        manifest="$BOSH_STATE/${key}_manifest"
+        [[ ! -L "$manifest" && ( ! -e "$manifest" || -f "$manifest" ) ]] || return 1
+        if [[ -f "$destination" ]]; then
+            dest_hash="$(bosh_managed_txn_hash "$destination")" || return 1
+        fi
+        if [[ -f "$manifest" ]]; then
+            manifest_hash="$(bosh_managed_txn_hash "$manifest")" || return 1
+        fi
+        if [[ "$dest_hash" != "$next_hash" || "$manifest_hash" != "$next_manifest_hash" ]]; then
+            [[ "$dest_hash" == "$prev_hash" &&
+               "$manifest_hash" == "$prev_manifest_hash" ]] || {
+                msg error "Completed journal does not match disk state: $dir"
+                return 1
+            }
+        fi
+    elif [[ "$phase" == completed && "$entries" != 0 ]]; then
+        # Missing record with remaining files is ambiguous, not disposable.
+        msg error "Incomplete completed journal preserved: $dir"
+        return 1
+    fi
+
+    # Explicit known-file deletion, not rm -rf. Record is deleted last.
+    for name in previous_destination previous next record.tmp record; do
+        entry="$dir/$name"
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        [[ ! -L "$entry" && -f "$entry" ]] || return 1
+        [[ "$(stat -c '%u' -- "$entry")" == "$own_uid" ]] || return 1
+        [[ "$(stat -c '%h' -- "$entry")" == 1 ]] || return 1
+        rm -f -- "$entry" || return 1
+    done
+    rmdir -- "$dir" || return 1
+}
+
+# This function is used only from serialized installer/uninstaller operations.
+# Never collect from a concurrent writer without holding the shared lock.
+bosh_managed_txn_collect() {
+    local key="$1" destination="$2" path phase
+    [[ "$key" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    [[ ! -L "$BOSH_STATE" && ( ! -e "$BOSH_STATE" || -d "$BOSH_STATE" ) ]] || return 1
+    [[ -d "$BOSH_STATE" ]] || return 0
+    bosh_managed_txn_safe_directory "$BOSH_STATE" || return 1
+
+    for path in "$BOSH_STATE/.${key}.managed-prepare."* \
+                "$BOSH_STATE/.${key}.managed-completed."*; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        case "$path" in
+            "$BOSH_STATE/.${key}.managed-prepare."*) phase=prepare ;;
+            "$BOSH_STATE/.${key}.managed-completed."*) phase=completed ;;
+            *) return 1 ;;
+        esac
+        if ! bosh_managed_txn_prune_dir "$key" "$path" "$phase" "$destination"; then
+            msg error "Journal residual requires manual inspection: $path"
+            return 1
+        fi
+        msg info "Safely cleaned orphaned journal: $path"
+    done
+}
+
 bosh_managed_txn_prepare() {
     local key="$1" destination="$2" previous_hash="$3" next_hash="$4" payload="$5"
     local dir="$BOSH_STATE/.${key}.managed-pending"
@@ -122,7 +245,7 @@ bosh_managed_txn_prepare() {
 }
 
 bosh_managed_txn_finish() {
-    local dir="$1" key="$2" completed entry filename
+    local dir="$1" key="$2" destination="$3" completed entry filename
     [[ "$key" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
     [[ "$dir" == "$BOSH_STATE/.${key}.managed-pending" ]] || return 1
     bosh_managed_txn_safe_directory "$BOSH_STATE" || return 1
@@ -146,10 +269,8 @@ bosh_managed_txn_finish() {
     completed="$(mktemp -d "$BOSH_STATE/.${key}.managed-completed.XXXXXXXX")" || return 1
     rmdir -- "$completed" || return 1
     mv -T -- "$dir" "$completed" || return 1
-    rm -rf -- "$completed" || {
-        msg warning "Committed transaction journal needs cleanup: $completed"
-        return 0
-    }
+    # Do not recursively delete snapshots or unknown files.
+    bosh_managed_txn_prune_dir "$key" "$completed" completed "$destination"
 }
 
 bosh_managed_txn_recover() {
@@ -161,6 +282,8 @@ bosh_managed_txn_recover() {
     local -a record=()
 
     [[ "$key" =~ ^[a-zA-Z0-9_-]+$ && "$destination" == /* ]] || return 1
+    # Any stale prepare/completed directories are reaped with strict checks.
+    bosh_managed_txn_collect "$key" "$destination" || return 1
     [[ ! -e "$dir" && ! -L "$dir" ]] && return 0
     if ! bosh_managed_txn_safe_directory "$BOSH_STATE" ||
        ! bosh_managed_txn_safe_directory "$dir" ||
@@ -224,14 +347,14 @@ bosh_managed_txn_recover() {
             msg error "Transaction manifest differs from expected state: $dir"
             return 1
         fi
-        bosh_managed_txn_finish "$dir" "$key" || return 1
+        bosh_managed_txn_finish "$dir" "$key" "$destination" || return 1
         msg info "Recovered interrupted managed-file transaction: $destination"
         return 0
     fi
 
     if [[ "$destination_hash" == "$previous_hash" &&
           "$manifest_hash" == "$previous_manifest_hash" ]]; then
-        bosh_managed_txn_finish "$dir" "$key" || return 1
+        bosh_managed_txn_finish "$dir" "$key" "$destination" || return 1
         msg info "Cleared uncommitted managed-file transaction: $destination"
         return 0
     fi
