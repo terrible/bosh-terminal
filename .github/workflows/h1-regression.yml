@@ -1,0 +1,51 @@
+name: H1 transaction recovery checks
+
+on:
+  push:
+    branches: [fix/h1-transaction-recovery]
+  pull_request:
+    branches: [fix/h2-test-isolation]
+
+permissions:
+  contents: read
+
+jobs:
+  static-and-h1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+      - name: Bash syntax
+        run: |
+          bash -n install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+      - name: ShellCheck
+        run: |
+          shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+      - name: Targeted H1 regression (isolated HOME)
+        run: |
+          bash tests/test-recovery-h1.sh
+          bash tests/test-temp-artifacts.sh
+
+  arch-full-suite:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    timeout-minutes: 20
+    steps:
+      - name: Install build and audit prerequisites
+        run: |
+          pacman -Syu --noconfirm --needed git shellcheck diffutils sudo
+      - uses: actions/checkout@v4
+      - name: Validate scripts
+        run: |
+          bash -n install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+          shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+      - name: Full regression as unprivileged user on Arch Linux
+        run: |
+          useradd -m -s /bin/bash bosh-ci
+          chown -R bosh-ci:bosh-ci "$GITHUB_WORKSPACE"
+          su -s /bin/bash bosh-ci -c "cd '$GITHUB_WORKSPACE' && env -u BOSH_HOME -u BOSH_STATE -u BOSH_BACKUP bash tests/run-tests.sh"
