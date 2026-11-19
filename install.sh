@@ -1087,6 +1087,45 @@ install_managed_file_or_skip() {
 # Install anime images without overwriting personal files
 # ------------------------------------------------------------
 
+# Staging paths are only cleaned by the invocation that created them.
+bosh_anime_stage_matches() {
+    local directory="$1" identity="$2"
+
+    [[ ! -L "$directory" && -d "$directory" &&
+       "$(stat -c '%d:%i:%u:%a' -- "$directory")" == "$identity" ]]
+}
+
+bosh_anime_candidate_matches() {
+    local path="$1" identity="$2"
+    local link_count=""
+
+    [[ ! -L "$path" && -f "$path" ]] || return 1
+    link_count="$(stat -c '%h' -- "$path")" || return 1
+    # A linked inode could be reachable outside the private 0700 staging dir.
+    [[ "$link_count" == 1 &&
+       "$(stat -c '%d:%i:%u:%a:%h:%z' -- "$path")" == "$identity" ]]
+}
+
+bosh_cleanup_anime_stage() {
+    local directory="$1" stage_identity="$2" path="$3" file_identity="$4" hash="$5"
+
+    if bosh_anime_stage_matches "$directory" "$stage_identity"; then
+        if [[ -e "$path" || -L "$path" ]]; then
+            if ! bosh_anime_candidate_matches "$path" "$file_identity" ||
+               ! bosh_remove_file_if_hash_matches "$path" "$hash"; then
+                msg warning "Anime staging candidate changed; preserved: $path"
+                return 1
+            fi
+        fi
+
+        # rmdir succeeds only when no other entries are present.
+        rmdir -- "$directory" 2>/dev/null && return 0
+    fi
+
+    msg warning "Anime staging directory preserved: $directory"
+    return 1
+}
+
 install_anime_images() {
     local source_file filename destination_file
     local name_hash state_key manifest_file
@@ -1095,10 +1134,12 @@ install_anime_images() {
     local candidate candidate_filename candidate_key
     local legacy_matches
     local file_hash temp_file rollback_file manifest_value
+    local stage_dir stage_identity file_identity destination_device
     local rollback_original_mode
     local manifest_owned
     local -a source_files=()
     local -a manifest_lines=()
+    local -a stage_cleanup=()
 
     ensure_directory "$ANIME_DEST" || return 1
     ensure_directory "$BOSH_STATE" || return 1
@@ -1253,22 +1294,37 @@ install_anime_images() {
             fi
         fi
 
-        # Prepare the new image in the destination filesystem.
-        temp_file="$(mktemp "${destination_file}.bosh-tmp.XXXXXX")" || return 1
-
-        bosh_register_temp "$temp_file" file || {
-            bosh_remove_temp_file "$temp_file"
-            return 1
-        }
-
-        if ! cp -p -- "$source_file" "$temp_file"; then
-            bosh_remove_temp_file "$temp_file"
+        # Preserve the source mode for the atomic rename while keeping the
+        # candidate private, even if SIGKILL prevents cleanup.
+        destination_device="$(stat -c '%d' -- "$ANIME_DEST")" || return 1
+        stage_dir="$(umask 077; mktemp -d -- "${destination_file}.bosh-tmp.XXXXXX")" || return 1
+        stage_identity="$(stat -c '%d:%i:%u:%a' -- "$stage_dir")" || return 1
+        if [[ "$stage_identity" != "$destination_device":*:"$EUID":700 &&
+              "$stage_identity" != "$destination_device":*:"$EUID":2700 ]] ||
+           ! bosh_anime_stage_matches "$stage_dir" "$stage_identity"; then
+            msg error "Unsafe anime staging directory; preserved: $stage_dir"
             return 1
         fi
 
+        # A setgid destination can pass the bit to a newly created directory.
+        if [[ "$stage_identity" == *:2700 ]]; then
+            chmod g-s -- "$stage_dir" || return 1
+            stage_identity="${stage_identity%:*}:700"
+            bosh_anime_stage_matches "$stage_dir" "$stage_identity" || return 1
+        fi
+
+        temp_file="$stage_dir/image"
+        if ! cp -pT -- "$source_file" "$temp_file"; then
+            msg warning "Incomplete anime staging directory preserved: $stage_dir"
+            return 1
+        fi
+        file_identity="$(stat -c '%d:%i:%u:%a:%h:%z' -- "$temp_file")" || return 1
+
+        stage_cleanup=("$stage_dir" "$stage_identity" "$temp_file" "$file_identity" "$source_hash")
+
         # Journal the expected hash before modifying the user's image path.
         if ! bosh_anime_txn_prepare "$state_key" "$filename" "$source_hash"; then
-            bosh_remove_temp_file "$temp_file" || true
+            bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
             return 1
         fi
 
@@ -1278,15 +1334,18 @@ install_anime_images() {
         if (( manifest_owned )) && [[ -f "$destination_file" ]]; then
             # Capture the old image mode independently of the snapshot:
             # the snapshot is private even when the image was 0644.
-            rollback_original_mode="$(stat -c '%a' -- "$destination_file")" || return 1
+            rollback_original_mode="$(stat -c '%a' -- "$destination_file")" || {
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
+                return 1
+            }
             if [[ ! "$rollback_original_mode" =~ ^[0-7]{3,4}$ ]]; then
                 msg error "Invalid original anime image mode: $destination_file"
-                bosh_remove_temp_file "$temp_file" || true
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 return 1
             fi
 
             rollback_file="$(mktemp "${destination_file}.bosh-rollback.XXXXXX")" || {
-                bosh_remove_temp_file "$temp_file"
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 return 1
             }
 
@@ -1295,59 +1354,60 @@ install_anime_images() {
             if [[ -L "$rollback_file" || ! -f "$rollback_file" ]] ||
                ! cp -- "$destination_file" "$rollback_file" ||
                [[ "$(stat -c '%a' -- "$rollback_file")" != 600 ]]; then
-                bosh_remove_temp_file "$temp_file" || true
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 bosh_remove_rollback_file "$rollback_file" || true
                 msg error "Could not prepare a private anime snapshot: $filename"
                 return 1
             fi
 
             if ! bosh_verify_rollback_file "$rollback_file" "$previous_hash"; then
-                bosh_remove_temp_file "$temp_file" || true
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 msg error "Anime rollback snapshot verification failed; preserved: $rollback_file"
                 return 1
             fi
 
             current_hash="$(sha256sum -- "$destination_file")" || {
-                bosh_remove_temp_file "$temp_file" || true
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 bosh_remove_rollback_file "$rollback_file" || true
                 return 1
             }
             current_hash="${current_hash%% *}"
 
             if [[ "$current_hash" != "$previous_hash" ]]; then
-                bosh_remove_temp_file "$temp_file" || true
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 bosh_remove_rollback_file "$rollback_file" || true
                 msg warning "Anime image changed during update; preserved: $filename"
                 continue
             fi
 
-            if ! mv -fT -- "$temp_file" "$destination_file"; then
-                bosh_remove_temp_file "$temp_file" || true
+            if ! bosh_anime_stage_matches "$stage_dir" "$stage_identity" ||
+               ! bosh_anime_candidate_matches "$temp_file" "$file_identity" ||
+               ! mv -fT -- "$temp_file" "$destination_file"; then
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 bosh_remove_rollback_file "$rollback_file" || true
                 return 1
             fi
-
-            bosh_forget_temp "$temp_file"
         else
             if [[ -e "$destination_file" || -L "$destination_file" ]]; then
-                bosh_remove_temp_file "$temp_file"
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 msg warning "Existing destination preserved: $filename"
                 continue
             fi
 
-            if ! mv -nT -- "$temp_file" "$destination_file"; then
-                bosh_remove_temp_file "$temp_file"
+            if ! bosh_anime_stage_matches "$stage_dir" "$stage_identity" ||
+               ! bosh_anime_candidate_matches "$temp_file" "$file_identity" ||
+               ! mv -nT -- "$temp_file" "$destination_file"; then
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 return 1
             fi
 
             if [[ -e "$temp_file" || -L "$temp_file" ]]; then
-                bosh_remove_temp_file "$temp_file"
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 msg warning "Destination appeared during installation; preserved: $filename"
                 continue
             fi
-
-            bosh_forget_temp "$temp_file"
         fi
+        bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
 
         file_hash="$(sha256sum -- "$destination_file")" || {
             if [[ -n "$rollback_file" ]]; then

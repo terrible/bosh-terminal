@@ -175,7 +175,8 @@ test_case "Temp audit: interrupted anime update keeps 0600 rollback despite 0644
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/anime-source"
 ANIME_DEST="$HOME/.local/share/fastfetch/anime"
-mkdir -p "$ANIME_SOURCE"
+mkdir -p "$ANIME_SOURCE" "$ANIME_DEST"
+chmod g+s -- "$ANIME_DEST"
 printf 'ORIGINAL SNAPSHOT\n' > "$ANIME_SOURCE/bosh1.png"
 chmod 644 "$ANIME_SOURCE/bosh1.png"
 install_anime_images
@@ -186,25 +187,79 @@ bash --noprofile --norc -euo pipefail -c '
     ANIME_SOURCE="$HOME/anime-source"
     ANIME_DEST="$HOME/.local/share/fastfetch/anime"
     mv() {
-        if [[ "${*: -1}" == "$ANIME_DEST/bosh1.png" ]]; then exit 86; fi
+        if [[ "${*: -1}" == "$ANIME_DEST/bosh1.png" ]]; then kill -KILL "$BASHPID"; fi
         command mv "$@"
     }
     install_anime_images
 ' || status=$?
-[[ "$status" -eq 86 ]]
+[[ "$status" -eq 137 ]]
 shopt -s nullglob
 rollbacks=( "$ANIME_DEST"/bosh1.png.bosh-rollback.* )
 [[ "${#rollbacks[@]}" -eq 1 ]]
 [[ "$(cat "${rollbacks[0]}")" == 'ORIGINAL SNAPSHOT' ]]
 [[ "$(stat -c '%a' -- "${rollbacks[0]}")" == 600 ]]
+stages=( "$ANIME_DEST"/bosh1.png.bosh-tmp.* )
+[[ "${#stages[@]}" -eq 1 ]]
+stage="${stages[0]}"
+if [[ -L "$stage" || ! -d "$stage" || "$(stat -c '%a:%u' -- "$stage")" != "700:$EUID" ]]; then
+    printf 'ERROR: candidate lacks private staging (mode %s)\n' "$(stat -c '%a' -- "$stage")"
+    exit 1
+fi
+[[ "$(stat -c '%d' -- "$stage")" == "$(stat -c '%d' -- "$ANIME_DEST")" ]]
+[[ "$(cat "$stage/image")" == 'UPDATED SNAPSHOT' ]]
 status=0
 output="$(bash "$BOSH_TEST_PROJECT/scripts/audit-temp-artifacts.sh")" || status=$?
-# A new-image candidate may remain with mode 0644. The rollback remains 0600.
-[[ "$status" -eq 2 ]]
+[[ "$status" -eq 0 ]]
 grep -Fq $'REVIEW\tanime-rollback\towner-ok;mode=600' <<< "$output"
-grep -Fq $'WARNING\tanime-tmp\tgroup-or-world-access;mode=644' <<< "$output"
+grep -Fq $'REVIEW\tanime-stage\tprivate-dir;ownership-unproven' <<< "$output"
 [[ -f "${rollbacks[0]}" ]]
 [[ "$(cat "$ANIME_DEST/bosh1.png")" == 'ORIGINAL SNAPSHOT' ]]
+bosh_anime_txn_recover_all
+printf 'keep\n' > "$stage/unknown"
+ln -s "$stage/unknown" "$stage/link"
+printf 'external edit\n' >> "$stage/image"
+install_anime_images
+installed_inode="$(stat -c '%i' -- "$ANIME_DEST/bosh1.png")"
+install_anime_images
+[[ "$(stat -c '%i:%a' -- "$ANIME_DEST/bosh1.png")" == "$installed_inode:644" ]]
+stages_after=( "$ANIME_DEST"/bosh1.png.bosh-tmp.* )
+[[ "${#stages_after[@]}" -eq 1 && "${stages_after[0]}" == "$stage" ]]
+source "$BOSH_TEST_PROJECT/uninstall.sh"
+ANIME_DEST="$HOME/.local/share/fastfetch/anime"
+bosh_uninstall_process_anime
+bosh_uninstall_process_anime
+[[ ! -e "$ANIME_DEST/bosh1.png" ]]
+[[ -L "$stage/link" && "$(cat "$stage/link")" == keep ]]
+grep -Fxq 'external edit' "$stage/image"
+CASE
+
+test_case "Anime stage: hardlinked candidate is preserved and rejected" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+stage="$(umask 077; mktemp -d -- "$HOME/anime-stage.XXXXXX")"
+[[ ! -L "$stage" && -d "$stage" && "$(stat -c '%a' -- "$stage")" == 700 ]]
+printf 'STAGED\n' > "$stage/image"
+chmod 644 -- "$stage/image"
+ln -- "$stage/image" "$stage/hardlink"
+[[ "$(stat -c '%h' -- "$stage/image")" == 2 ]]
+identity="$(stat -c '%d:%i:%u:%a:%h:%z' -- "$stage/image")"
+stage_identity="$(stat -c '%d:%i:%u:%a' -- "$stage")"
+file_hash="$(bosh_file_sha256 "$stage/image")"
+if bosh_anime_candidate_matches "$stage/image" "$identity"; then
+    printf 'ERROR: hardlinked anime candidate accepted\n'
+    exit 1
+fi
+if bosh_cleanup_anime_stage "$stage" "$stage_identity" "$stage/image" "$identity" "$file_hash"; then
+    printf 'ERROR: hardlinked anime candidate cleaned\n'
+    exit 1
+fi
+[[ -f "$stage/image" && -f "$stage/hardlink" ]]
+[[ "$(stat -c '%h' -- "$stage/image")" == 2 ]]
+# A normal single-link file must still be eligible for safe cleanup.
+rm -- "$stage/hardlink"
+identity="$(stat -c '%d:%i:%u:%a:%h:%z' -- "$stage/image")"
+bosh_anime_candidate_matches "$stage/image" "$identity"
+bosh_cleanup_anime_stage "$stage" "$stage_identity" "$stage/image" "$identity" "$file_hash"
+[[ ! -e "$stage" && ! -L "$stage" ]]
 CASE
 
 test_summary
