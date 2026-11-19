@@ -20,7 +20,15 @@ La auditoría inicial **no ejecuta borrado automático**, ni `chmod`, ni mueve a
 | Staging para restauración de rollback | `*.png.bosh-restore.XXXXXX` | Puede quedar si se interrumpe una restauración |
 | Backups permanentes `$BOSH_BACKUP` | Ruta versionada y respaldada | **No** son basura ni deben incluirse en una limpieza de temporales |
 
-El código de imágenes usa `cp -p` para crear el rollback sobre un archivo generado con `mktemp`. **`cp -p` conserva el modo de la imagen original**: si era `0644`, el respaldo temporal puede conservar también `0644`. Esto no implica que los datos originales fueran privados, pero sí prolonga la exposición de una copia que puede permanecer después de borrar la imagen publicada. Es una mejora de endurecimiento pendiente; **el auditor lo detecta, sin modificar permisos**.
+### Hallazgo de permisos en snapshots — corregido experimentalmente
+
+Anteriormente, `install_anime_images()` utilizaba `cp -p` para poblar un rollback creado con `mktemp`; así podía copiar también los permisos `0644` del archivo original. **En la rama H1 esto se sustituyó por una copia sin `-p` sobre el archivo privado `0600`, con comprobación explícita del modo antes de utilizar el snapshot.**
+
+El modo de la imagen original se mantiene independiente del snapshot. `bosh_restore_rollback_file()` recibe ese modo y lo aplica al destino después del reemplazo atómico, verificando el resultado antes de limpiar el rollback. Los nuevos diarios anime conservan `previous_mode` como octavo campo; la recuperación sigue aceptando diarios antiguos de siete campos.
+
+**Un corte justo después del `mv` de restauración y antes de `chmod` puede dejar el destino temporalmente en `0600`.** Si el contenido y el manifiesto coinciden con la versión previa, pero el modo difiere, la recuperación de un diario nuevo rechaza la finalización automática y conserva el diario y el snapshot para inspección. No modifica un permiso que podría haber cambiado el usuario.
+
+**Hallazgo independiente:** la imagen candidata `*.bosh-tmp.*` sigue usando `cp -p` para mantener los permisos del recurso publicado. Una interrupción puede dejar un candidato `0644`; la auditoría lo informa como `WARNING`. Esta etapa no cambia ese protocolo de publicación ni elimina residuos por nombre.
 
 ## Herramienta añadida — solo lectura
 
@@ -51,15 +59,16 @@ No necesita `sudo`. Actualmente se encuentra solo en la rama de desarrollo H1, n
 
 `tests/test-temp-artifacts.sh` crea `HOME` y `XDG_DATA_HOME` aislados. Los escenarios incluyen: directorio vacío, clonación privada, rollback privado con hash, staging temporal/restauración, modo `0644`, symlink, hardlink, nombre inesperado, clonación simbólica, permisos de directorio no privados, symlink en un padre XDG, rechazo de parámetros destructivos, `SIGKILL` real durante publicación Oh My Zsh y actualización anime interrumpida con rollback residual.
 
-La CI comprueba sintaxis y ShellCheck del auditor y ejecuta estas pruebas sin `sudo` ni modificaciones del `HOME` real. **[Ejecución #44445178671](https://github.com/terrible/bosh-terminal/actions/runs/44445178671): 14/14 escenarios de auditoría PASS, suite completa Arch 16/16 módulos PASS, jobs Ubuntu y Arch 2/2 PASS.**
+La CI comprueba sintaxis y ShellCheck del auditor y ejecuta estas pruebas sin `sudo` ni modificaciones del `HOME` real. **[Ejecución #44447701673](https://github.com/terrible/bosh-terminal/actions/runs/44447701673): 14/14 escenarios del auditor PASS, 8/8 regresiones de permisos y diario de rollback anime PASS, suite Arch 17/17 módulos PASS y 2/2 jobs PASS.**
 
-## Plan de remediación: aún no implementado
+## Remediación y trabajo pendiente
 
 1. Crear un identificador durable de operación antes de publicar snapshots, y registrar su ruta exacta, tipo, hash y estado (sin depender del patrón de nombre).
 2. Mantener snapshots recuperables mientras exista una operación incompleta y verificar el estado antes de limpiarlos.
 3. Diseñar una recolección sin seguimiento de symlinks, sin borrado recursivo a ciegas y segura frente a cambios concurrentes.
-4. Reconsiderar `cp -p` en los rollback anime para retener contenido en archivos `0600` y **restaurar posteriormente los permisos originales**; validar con tests de modos `0600`, `0640`, `0644`.
-5. Probar fallos entre todas las transiciones de staging/journal/manifest/cleanup y reintentos idempotentes.
+4. **Implementado y probado:** rollback anime `0600` independiente del modo original, restauración verificable `0600`/`0640`/`0644`, y metadatos originales durables en el diario; los estados ambiguos se preservan.
+5. Probar más fallos entre todas las transiciones de staging/journal/manifest/cleanup y reintentos idempotentes; aún faltan errores de E/S y cortes de energía.
 6. Documentar un procedimiento de cuarentena **manual** con respaldos verificables; no ejecutar limpiezas sobre archivos personales automáticamente.
+7. Revisar la exposición de candidatos `.bosh-tmp.*` con modo heredado por `cp -p`, sin perder los permisos finales ni el contrato de recuperación.
 
 **Estado:** se incorpora una herramienta de diagnóstico y cobertura de regresión. La limpieza segura automática **permanece bloqueada** hasta contar con identidad/procedencia durable, pruebas ampliadas y revisión de seguridad. H1 no está cerrado; no autoriza merge ni release.
