@@ -349,6 +349,14 @@ bosh_uninstall_process_anime() {
         return 1
     fi
 
+    # Reconcile crash-consistency journals BEFORE interpreting any image state.
+    if ! bosh_anime_txn_recover_all; then
+        msg warning "Pending anime image transactions need review; preserving them."
+        BOSH_UNINSTALL_PRESERVED=$((BOSH_UNINSTALL_PRESERVED + 1))
+        BOSH_UNINSTALL_ERRORS=$((BOSH_UNINSTALL_ERRORS + 1))
+        return 1
+    fi
+
     # Legacy records can only be mapped using unambiguous project assets.
     if bosh_uninstall_safe_directory "$ANIME_SOURCE"; then
         source_files=("$ANIME_SOURCE"/*.png)
@@ -874,6 +882,7 @@ main() {
 
     # Recover any interrupted first-time OMZ publication before other writes.
     bosh_omz_txn_recover || return 1
+    bosh_anime_txn_recover_all || return 1
 
     for key in \
         zsh_config \
