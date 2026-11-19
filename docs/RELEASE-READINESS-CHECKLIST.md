@@ -14,11 +14,13 @@
 - [x] Regresiones anime: 7/7 PASS (CI #44439239909).
 - [x] Suite actual completa en contenedor Arch: 15/15 módulos PASS (CI #44439239909).
 - [x] Bash syntax y ShellCheck PASS en las ramas probadas.
+- [x] Auditoría de residuos temporal **solo lectura**, con pruebas de `SIGKILL` reales sobre clonación OMZ y rollback anime: **14/14 PASS**, suite Arch **16/16 módulos PASS** ([CI #44445178671](https://github.com/terrible/bosh-terminal/actions/runs/44445178671)); ver [reporte](TEMP-ARTIFACTS-AUDIT.md).
 
 ## Bloqueos pendientes antes de una versión pública
 
 - [ ] Auditar las condiciones de carrera y los enlaces simbólicos en rutas involucradas en diarios y renombrados, incluyendo procesos externos al lock.
 - [ ] Definir un procedimiento seguro para identificar y limpiar snapshots de rollback anime y carpetas de clonación Oh My Zsh que permanezcan tras `SIGKILL`, sin borrar datos personales desconocidos.
+- [ ] Evitar que snapshots de rollback retengan permisos amplios heredados por `cp -p` (modo `0644` observado en test real), conservando el modo original cuando sea necesaria una restauración.
 - [ ] Definir el alcance de durabilidad frente a `SIGKILL` versus pérdida de energía; si se promete recuperación ante apagón, implementar y ensayar `fsync` de archivos y directorios.
 - [ ] Revisar la política de versión de Oh My Zsh upstream y la coherencia de commit/hash de árbol en repositorios preexistentes.
 - [ ] Confirmar colección anime distribuible, atribución y licencias de recursos gráficos.
