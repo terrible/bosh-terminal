@@ -141,3 +141,31 @@ bosh_anime_txn_recover() {
     msg error "Ambiguous anime transaction; image preserved: $filename"
     return 1
 }
+
+# Enumerate only journal names, never arbitrary manifest-chosen paths. This
+# lets uninstall recover a pending transaction even if an asset was removed
+# from a later project release.
+bosh_anime_txn_recover_all() {
+    local path key filename encoded canonical
+    local -a entries=()
+
+    [[ ! -L "$BOSH_STATE" ]] || return 1
+    [[ -e "$BOSH_STATE" ]] || return 0
+    bosh_managed_txn_safe_directory "$BOSH_STATE" || return 1
+    for path in "$BOSH_STATE"/anime_*_txn; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        key="${path##*/}"
+        key="${key%_txn}"
+        [[ "$key" =~ ^anime_[a-f0-9]{64}$ ]] || return 1
+        [[ ! -L "$path" && -f "$path" ]] || return 1
+        mapfile -t entries < "$path" || return 1
+        (( ${#entries[@]} == 7 )) || return 1
+        [[ "${entries[2]}" == filename_b64=* ]] || return 1
+        encoded="${entries[2]#filename_b64=}"
+        [[ "$encoded" =~ ^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$ ]] || return 1
+        filename="$(printf '%s' "$encoded" | base64 --decode 2>/dev/null)" || return 1
+        canonical="$(printf '%s' "$filename" | base64 -w 0)" || return 1
+        [[ "$canonical" == "$encoded" ]] || return 1
+        bosh_anime_txn_recover "$key" "$filename" || return 1
+    done
+}
