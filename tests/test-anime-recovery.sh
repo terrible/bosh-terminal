@@ -4,6 +4,7 @@ set -uo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/helpers.sh"
 
 test_case "Anime H1: first image crash before manifest is adopted and removable" <<'CASE'
+set -x
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/mock-source"
 ANIME_DEST="$HOME/mock-dest"
@@ -35,6 +36,7 @@ bosh_uninstall_process_anime
 CASE
 
 test_case "Anime H1: managed image update is reconciled after SIGKILL" <<'CASE'
+set -x
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/mock-source"
 ANIME_DEST="$HOME/mock-dest"
@@ -101,6 +103,7 @@ install_anime_images
 CASE
 
 test_case "Anime H1: external edit after crash is preserved without adoption" <<'CASE'
+set -x
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/mock-source"
 ANIME_DEST="$HOME/mock-dest"
