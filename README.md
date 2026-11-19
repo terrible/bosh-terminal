@@ -36,6 +36,12 @@ The installer requires Bash, `pacman`, `flock`, `git`, `tar`, `base64`, `awk`,
 `cmp`, and `sha256sum`. Administrative privileges through `sudo` are needed
 when system packages must be installed.
 
+Replacing a managed configuration requires GNU coreutils 9.5 or newer and
+atomic exchange support on the destination filesystem. The installer retains
+displaced files in a private directory alongside the destination. See the
+[managed-file recovery guide](docs/TOCTOU-MANAGED-01.md) for retention and
+recovery details.
+
 ## Installation
 
 Run the installer from the project directory:

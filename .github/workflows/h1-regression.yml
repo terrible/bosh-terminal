@@ -19,25 +19,37 @@ concurrency:
 jobs:
   bash-and-h1:
     name: Bash, ShellCheck and H1 recovery
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install ShellCheck
+      - name: Install ShellCheck and GNU utilities
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck gnu-coreutils
+      - name: Select GNU utilities for regression tests
+        run: |
+          gnu_bin="$(mktemp -d "$RUNNER_TEMP/bosh-gnu-bin.XXXXXXXX")"
+          for utility in base64 chmod cp ln mkdir mktemp mv rm rmdir sha256sum stat; do
+            test -x "/usr/bin/gnu$utility"
+            ln -s "/usr/bin/gnu$utility" "$gnu_bin/$utility"
+          done
+          "$gnu_bin/mv" --version
+          printf '%s\n' "$gnu_bin" >> "$GITHUB_PATH"
       - name: Bash syntax
         run: |
-          bash -n install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+          for script in install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh; do
+            bash -n "$script" || exit 1
+          done
       - name: ShellCheck
         run: |
           shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
-      - name: Targeted H1 regression in isolated HOME
+      - name: H1, TOCTOU and temporary artifact regression in isolated HOME
         run: |
           bash tests/test-recovery-h1.sh
+          bash tests/test-toctou-managed.sh
           bash tests/test-temp-artifacts.sh
 
   arch-full-suite:
@@ -55,10 +67,17 @@ jobs:
           persist-credentials: false
       - name: Bash syntax and ShellCheck
         run: |
-          bash -n install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+          for script in install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh; do
+            bash -n "$script" || exit 1
+          done
           shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
-      - name: Run full test suite as unprivileged user with no controlling terminal
+      - name: Prepare the unprivileged test user
         run: |
           useradd -m -s /bin/bash bosh-ci
           chown -R bosh-ci:bosh-ci "$GITHUB_WORKSPACE"
+      - name: H1 and TOCTOU regression in isolated HOME
+        run: |
+          setsid -w su -s /bin/bash bosh-ci -c "cd '$GITHUB_WORKSPACE' && bash tests/test-recovery-h1.sh && bash tests/test-toctou-managed.sh"
+      - name: Run full test suite as unprivileged user with no controlling terminal
+        run: |
           setsid -w su -s /bin/bash bosh-ci -c "cd '$GITHUB_WORKSPACE' && env -u BOSH_HOME -u BOSH_STATE -u BOSH_BACKUP bash tests/run-tests.sh"
