@@ -172,7 +172,6 @@ grep -Fq 'review=1' <<< "$output"
 CASE
 
 test_case "Temp audit: interrupted anime update keeps 0600 rollback despite 0644 image" <<'CASE'
-set -x
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/anime-source"
 ANIME_DEST="$HOME/.local/share/fastfetch/anime"
@@ -200,11 +199,10 @@ rollbacks=( "$ANIME_DEST"/bosh1.png.bosh-rollback.* )
 [[ "$(stat -c '%a' -- "${rollbacks[0]}")" == 600 ]]
 status=0
 output="$(bash "$BOSH_TEST_PROJECT/scripts/audit-temp-artifacts.sh")" || status=$?
-[[ "$status" -eq 0 ]]
-grep -Fq 
-[[ -f "${rollbacks[0]}" ]]
-[[ "$(cat "$ANIME_DEST/bosh1.png")" == 'ORIGINAL SNAPSHOT' ]]REVIEW\tanime-rollback\t' <<< "$output"
-grep -Fq 'mode=600' <<< "$output"
+# A new-image candidate may remain with mode 0644. The rollback remains 0600.
+[[ "$status" -eq 2 ]]
+grep -Fq $'REVIEW\tanime-rollback\towner-ok;mode=600' <<< "$output"
+grep -Fq $'WARNING\tanime-tmp\tgroup-or-world-access;mode=644' <<< "$output"
 [[ -f "${rollbacks[0]}" ]]
 [[ "$(cat "$ANIME_DEST/bosh1.png")" == 'ORIGINAL SNAPSHOT' ]]
 CASE
