@@ -1095,6 +1095,7 @@ install_anime_images() {
     local candidate candidate_filename candidate_key
     local legacy_matches
     local file_hash temp_file rollback_file manifest_value
+    local rollback_original_mode
     local manifest_owned
     local -a source_files=()
     local -a manifest_lines=()
@@ -1272,16 +1273,31 @@ install_anime_images() {
         fi
 
         rollback_file=""
+        rollback_original_mode=""
 
         if (( manifest_owned )) && [[ -f "$destination_file" ]]; then
+            # Capture the old image mode independently of the snapshot:
+            # the snapshot is private even when the image was 0644.
+            rollback_original_mode="$(stat -c '%a' -- "$destination_file")" || return 1
+            if [[ ! "$rollback_original_mode" =~ ^[0-7]{3,4}$ ]]; then
+                msg error "Invalid original anime image mode: $destination_file"
+                bosh_remove_temp_file "$temp_file" || true
+                return 1
+            fi
+
             rollback_file="$(mktemp "${destination_file}.bosh-rollback.XXXXXX")" || {
                 bosh_remove_temp_file "$temp_file"
                 return 1
             }
 
-            if ! cp -p -- "$destination_file" "$rollback_file"; then
+            # mktemp creates a 0600 file. cp (without -p) does not copy the
+            # source mode onto an existing destination. Verify before use.
+            if [[ -L "$rollback_file" || ! -f "$rollback_file" ]] ||
+               ! cp -- "$destination_file" "$rollback_file" ||
+               [[ "$(stat -c '%a' -- "$rollback_file")" != 600 ]]; then
                 bosh_remove_temp_file "$temp_file" || true
                 bosh_remove_rollback_file "$rollback_file" || true
+                msg error "Could not prepare a private anime snapshot: $filename"
                 return 1
             fi
 
@@ -1337,7 +1353,7 @@ install_anime_images() {
             if [[ -n "$rollback_file" ]]; then
                 bosh_restore_rollback_file \
                     "$rollback_file" "$destination_file" \
-                    "$source_hash" "$previous_hash" ||
+                    "$source_hash" "$previous_hash" "$rollback_original_mode" ||
                     msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
             else
                 msg warning "Could not verify anime image; destination preserved: $destination_file"
@@ -1350,7 +1366,7 @@ install_anime_images() {
             if [[ -n "$rollback_file" ]]; then
                 bosh_restore_rollback_file \
                     "$rollback_file" "$destination_file" \
-                    "$source_hash" "$previous_hash" ||
+                    "$source_hash" "$previous_hash" "$rollback_original_mode" ||
                     msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
             else
                 msg warning "Unexpected anime image content; destination preserved: $destination_file"
@@ -1370,7 +1386,7 @@ install_anime_images() {
             if [[ -n "$rollback_file" ]]; then
                 bosh_restore_rollback_file \
                     "$rollback_file" "$destination_file" \
-                    "$file_hash" "$previous_hash" ||
+                    "$file_hash" "$previous_hash" "$rollback_original_mode" ||
                     msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
             else
                 bosh_remove_file_if_hash_matches "$destination_file" "$file_hash" || true
