@@ -30,6 +30,15 @@ El modo de la imagen original se mantiene independiente del snapshot. `bosh_rest
 
 **Hallazgo independiente:** la imagen candidata `*.bosh-tmp.*` sigue usando `cp -p` para mantener los permisos del recurso publicado. Una interrupción puede dejar un candidato `0644`; la auditoría lo informa como `WARNING`. Esta etapa no cambia ese protocolo de publicación ni elimina residuos por nombre.
 
+## Actualización de alcance — candidata integral (19-11-2026)
+
+**Histórico:** los hallazgos anteriores describen la implementación H1 original. No deben confundirse con el estado del código de `integration/bosh-terminal-candidate` (PR #11).
+
+- El candidato anime se prepara en un **directorio privado de staging `0700`**. Aunque `cp -p` preserve el modo interno del recurso, la ruta queda protegida por el directorio. La publicación verifica identidad del directorio y del candidato, número de enlaces `1` y hash.
+- La regresión de la candidata incluye pruebas de staging privado, hardlinks, rollback y journaling; GitHub Actions de PR #11: [push PASS](https://github.com/terrible/bosh-terminal/actions/runs/44471564440) y [pull request PASS](https://github.com/terrible/bosh-terminal/actions/runs/44471613661).
+- **Sin resolver:** identificación y tratamiento de staging legado, residuos de clonaciones OMZ y respaldos potencialmente reutilizados o modificados por terceros. Un prefijo de nombre nunca autoriza borrar. Permanece pendiente la auditoría de carreras externas y los límites frente a pérdida de energía.
+- Esta actualización **no sustituye** la política original de herramienta de inventario en solo lectura ni concede autorización de limpieza automática.
+
 ## Herramienta añadida — solo lectura
 
 `scripts/audit-temp-artifacts.sh` comprueba exclusivamente los patrones documentados en `HOME` y `XDG_DATA_HOME`. Usa `stat` y `sha256sum`; no evalúa diarios ni sigue symlinks. Comprueba:
