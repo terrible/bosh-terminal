@@ -18,6 +18,7 @@ source "$PROJECT_DIR/scripts/lib/common.sh"
 source "$PROJECT_DIR/scripts/lib/managed-transaction.sh"
 source "$PROJECT_DIR/scripts/lib/zsh-transaction.sh"
 source "$PROJECT_DIR/scripts/lib/omz-transaction.sh"
+source "$PROJECT_DIR/scripts/lib/anime-transaction.sh"
 
 # ------------------------------------------------------------
 # Paths
@@ -1127,6 +1128,9 @@ install_anime_images() {
         source_hash="$(sha256sum -- "$source_file")" || return 1
         source_hash="${source_hash%% *}"
 
+        # Heal an interrupted publication before trusting image ownership.
+        bosh_anime_txn_recover "$state_key" "$filename" || return 1
+
         if [[ -L "$manifest_file" ]]; then
             msg error "Refusing to read a symbolic link: $manifest_file"
             return 1
@@ -1261,6 +1265,12 @@ install_anime_images() {
             return 1
         fi
 
+        # Journal the expected hash before modifying the user's image path.
+        if ! bosh_anime_txn_prepare "$state_key" "$filename" "$source_hash"; then
+            bosh_remove_temp_file "$temp_file" || true
+            return 1
+        fi
+
         rollback_file=""
 
         if (( manifest_owned )) && [[ -f "$destination_file" ]]; then
@@ -1371,6 +1381,7 @@ install_anime_images() {
         fi
 
         [[ -z "$rollback_file" ]] || bosh_remove_rollback_file "$rollback_file" || true
+        bosh_anime_txn_recover "$state_key" "$filename" || return 1
 
         msg success "Installed or updated anime image: $filename"
     done
@@ -1907,6 +1918,7 @@ main() {
     bosh_zsh_uninstall_txn_recover || return 1
     bosh_zsh_txn_recover || return 1
     bosh_omz_txn_recover || return 1
+    bosh_anime_txn_recover_all || return 1
 
     install_dependencies || return 1
     install_oh_my_zsh || return 1
