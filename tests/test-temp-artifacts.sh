@@ -172,6 +172,7 @@ grep -Fq 'review=1' <<< "$output"
 CASE
 
 test_case "Temp audit: interrupted anime update keeps 0600 rollback despite 0644 image" <<'CASE'
+set -x
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/anime-source"
 ANIME_DEST="$HOME/.local/share/fastfetch/anime"
