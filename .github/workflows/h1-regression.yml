@@ -21,13 +21,14 @@ jobs:
           sudo apt-get install -y shellcheck
       - name: Bash syntax
         run: |
-          bash -n install.sh uninstall.sh scripts/lib/*.sh tests/*.sh
+          bash -n install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
       - name: ShellCheck
         run: |
-          shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/lib/*.sh tests/*.sh
+          shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
       - name: Targeted H1 regression (isolated HOME)
         run: |
           bash tests/test-recovery-h1.sh
+          bash tests/test-temp-artifacts.sh
 
   arch-full-suite:
     runs-on: ubuntu-latest
@@ -41,8 +42,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate scripts
         run: |
-          bash -n install.sh uninstall.sh scripts/lib/*.sh tests/*.sh
-          shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/lib/*.sh tests/*.sh
+          bash -n install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+          shellcheck --norc -x -P SCRIPTDIR install.sh uninstall.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
       - name: Full regression as unprivileged user on Arch Linux
         run: |
           useradd -m -s /bin/bash bosh-ci
