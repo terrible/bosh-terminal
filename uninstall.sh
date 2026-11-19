@@ -872,6 +872,9 @@ main() {
     acquire_install_lock || return 1
     setup_install_traps
 
+    # Recover any interrupted first-time OMZ publication before other writes.
+    bosh_omz_txn_recover || return 1
+
     for key in \
         zsh_config \
         starship \
