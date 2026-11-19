@@ -3,10 +3,13 @@ name: Bosh Terminal regression
 on:
   push:
     branches:
+      - main
       - integration/bosh-terminal-candidate
+      - 'ci/**'
   pull_request:
     branches:
       - main
+      - integration/bosh-terminal-candidate
   workflow_dispatch:
 
 permissions:
@@ -19,10 +22,10 @@ concurrency:
 jobs:
   bash-and-h1:
     name: Bash, ShellCheck and H1 recovery
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install ShellCheck
@@ -42,15 +45,15 @@ jobs:
 
   arch-full-suite:
     name: Full regression on Arch Linux (non-root, no TTY)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
-      image: archlinux:latest
+      image: archlinux:base-20261108.0.623074@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
     timeout-minutes: 20
     steps:
       - name: Install test prerequisites
         run: |
           pacman -Syu --noconfirm --needed git shellcheck diffutils sudo util-linux
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Bash syntax and ShellCheck
