@@ -146,4 +146,63 @@ fi
 grep -Fq 'Unsupported arguments' "$HOME/invalid-arg"
 CASE
 
+
+test_case "Temp audit: SIGKILL during actual OMZ publication leaves a reviewable clone" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+source "$BOSH_TEST_PROJECT/tests/omz-recovery-fixture.sh"
+test_setup_omz_recovery_git
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    mv() {
+        if [[ "${*: -1}" == "$HOME/.oh-my-zsh" ]]; then kill -KILL "$BASHPID"; fi
+        command mv "$@"
+    }
+    install_oh_my_zsh
+' || status=$?
+[[ "$status" -eq 137 ]]
+shopt -s nullglob
+parents=( "$HOME"/.oh-my-zsh.bosh-tmp.* )
+[[ "${#parents[@]}" == 1 && -d "${parents[0]}/repo" ]]
+output="$(bash "$BOSH_TEST_PROJECT/scripts/audit-temp-artifacts.sh")"
+grep -Fq REVIEW\tomz-stage\t' <<< "$output"
+grep -Fq SUMMARY\treview=1\twarning=0\tunsafe=0' <<< "$output"
+[[ -f "${parents[0]}/repo/oh-my-zsh.sh" ]]
+[[ -f "$BOSH_STATE/oh_my_zsh_txn" ]]
+CASE
+
+test_case "Temp audit: actual interrupted anime update exposes rollback mode" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+ANIME_SOURCE="$HOME/anime-source"
+ANIME_DEST="$HOME/.local/share/fastfetch/anime"
+mkdir -p "$ANIME_SOURCE"
+printf 'ORIGINAL SNAPSHOT\n' > "$ANIME_SOURCE/bosh1.png"
+chmod 644 "$ANIME_SOURCE/bosh1.png"
+install_anime_images
+printf 'UPDATED SNAPSHOT\n' > "$ANIME_SOURCE/bosh1.png"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    ANIME_SOURCE="$HOME/anime-source"
+    ANIME_DEST="$HOME/.local/share/fastfetch/anime"
+    mv() {
+        if [[ "${*: -1}" == "$ANIME_DEST/bosh1.png" ]]; then exit 86; fi
+        command mv "$@"
+    }
+    install_anime_images
+' || status=$?
+[[ "$status" -eq 86 ]]
+shopt -s nullglob
+rollbacks=( "$ANIME_DEST"/bosh1.png.bosh-rollback.* )
+[[ "${#rollbacks[@]}" -eq 1 ]]
+[[ "$(cat "${rollbacks[0]}")" == 'ORIGINAL SNAPSHOT' ]]
+[[ "$(stat -c '%a' -- "${rollbacks[0]}")" == 644 ]]
+status=0
+output="$(bash "$BOSH_TEST_PROJECT/scripts/audit-temp-artifacts.sh")" || status=$?
+[[ "$status" -eq 2 ]]
+grep -Fq WARNING\tanime-rollback\tgroup-or-world-access;mode=644' <<< "$output"
+[[ -f "${rollbacks[0]}" ]]
+[[ "$(cat "$ANIME_DEST/bosh1.png")" == 'ORIGINAL SNAPSHOT' ]]
+CASE
+
 test_summary
