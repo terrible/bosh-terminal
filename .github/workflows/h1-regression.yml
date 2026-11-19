@@ -5,6 +5,7 @@ on:
     branches:
       - ci/bosh-terminal-regression
       - ci/consent-regression
+      - test/consent-real-h1-journal
       - fix/anime-private-staging
       - fix/h1-transaction-recovery
   pull_request:
@@ -14,6 +15,7 @@ on:
       - fix/h1-transaction-recovery
       - fix/anime-private-staging
       - fix/install-consent
+      - ci/consent-regression
   workflow_dispatch:
 
 permissions:
