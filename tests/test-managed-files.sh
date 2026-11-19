@@ -564,61 +564,47 @@ CASE
 
 
 
-test_case "Managed-file integration: rollback after manifest failure" <<'CASE'
+test_case "Managed-file integration: manifest failure is retried without another displacement" <<'CASE'
 source "$BOSH_TEST_PROJECT/install.sh"
 
 source_file="$HOME/source-managed"
 destination="$HOME/managed-destination"
-state_key="rollback_managed_failure"
+state_key="manifest_retry"
+manifest="$BOSH_STATE/${state_key}_manifest"
+pending="$BOSH_STATE/.${state_key}.managed-pending"
 
 printf '%s' "original managed content" > "$source_file"
 install_managed_file "$source_file" "$destination" "$state_key"
-
-expected="$HOME/expected-managed-content"
-cp -p -- "$destination" "$expected"
-
-manifest="$BOSH_STATE/${state_key}_manifest"
+original_inode="$(stat -c '%d:%i' -- "$destination")"
 manifest_hash="$(bosh_file_sha256 "$manifest")"
-
 printf '%s' "replacement managed content" > "$source_file"
 
-# Fail only when the installer attempts to register this update.
-write_manifest() {
-    if [[ "${1:-}" == "$state_key" ]]; then
-        msg error "Simulated manifest write failure: $state_key"
-        return 1
-    fi
-
-    msg error "Unexpected manifest write request: ${1:-}"
-    return 1
-}
-
-if install_managed_file "$source_file" "$destination" "$state_key"; then
-    echo "ERROR: la instalación debía fallar al escribir el manifiesto."
-    exit 1
-else
-    install_exit=$?
-fi
-
-[[ "$install_exit" -eq 1 ]]
-cmp -s "$expected" "$destination"
+status=0
+(
+    # Fail before the atomic manifest rename, through the normal writer.
+    mv() {
+        if [[ "${*: -1}" == "$manifest" ]]; then
+            return 1
+        fi
+        command mv "$@"
+    }
+    install_managed_file "$source_file" "$destination" "$state_key"
+) || status=$?
+[[ "$status" == 1 && -f "$pending/record" ]]
+cmp -s "$source_file" "$destination"
 [[ "$(bosh_file_sha256 "$manifest")" == "$manifest_hash" ]]
+slots=("$HOME"/.bosh-managed-manifest_retry.*/file)
+[[ "${#slots[@]}" -eq 1 && "$(cat -- "${slots[0]}")" == "original managed content" ]]
+[[ "$(stat -c '%d:%i' -- "${slots[0]}")" == "$original_inode" ]]
+candidate_inode="$(stat -c '%d:%i' -- "$destination")"
 
-if compgen -G "${destination}.bosh-rollback.*" >/dev/null; then
-    echo "ERROR: quedó un snapshot de rollback."
-    exit 1
-fi
-
-if compgen -G "${destination}.bosh-restore.*" >/dev/null; then
-    echo "ERROR: quedó un staging de restauración."
-    exit 1
-fi
-
+install_managed_file "$source_file" "$destination" "$state_key"
+read_manifest "$state_key"
+[[ "${BOSH_MANIFEST[sha256]}" == "$(bosh_file_sha256 "$source_file")" ]]
+[[ "$(stat -c '%d:%i' -- "$destination")" == "$candidate_inode" ]]
+[[ ! -e "$pending" ]]
 [[ "${#BOSH_TEMP_PATHS[@]}" -eq 0 ]]
 [[ "${#BOSH_TEMP_TYPES[@]}" -eq 0 ]]
-
-echo "Fallo de manifiesto propagado; archivo anterior y manifiesto preservados."
-echo "Sin snapshots ni temporales residuales."
 CASE
 
 test_case "Anime integration: rollback after state failure" <<'CASE'

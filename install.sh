@@ -594,7 +594,9 @@ install_managed_file() {
     local source_hash=""
     local current_hash=""
     local initial_destination_hash=""
-    local file_hash=""
+    local initial_destination_id="-"
+    local initial_destination_fingerprint=""
+    local needs_backup=0
     local existed_before=0
     local destination_exists=0
     local manifest_exists=0
@@ -608,8 +610,6 @@ install_managed_file() {
     local decoded_path=""
     local canonical_b64=""
     local temp_file=""
-    local rollback_file=""
-    local component=""
     local -a previous=()
     local -a decoded_values=()
     local -a manifest_fields=()
@@ -633,8 +633,7 @@ install_managed_file() {
     manifest_file="$BOSH_STATE/${state_key}_manifest"
 
     destination_b64="$(printf '%s' "$destination" | base64 -w 0)" || return 1
-    source_hash="$(sha256sum -- "$source_file")" || return 1
-    source_hash="${source_hash%% *}"
+    source_hash="$(bosh_managed_txn_hash "$source_file")" || return 1
 
     if [[ -L "$manifest_file" ]]; then
         msg error "Refusing to read a symbolic link: $manifest_file"
@@ -816,9 +815,10 @@ install_managed_file() {
 
     if [[ -f "$destination" ]]; then
         destination_exists=1
-        current_hash="$(sha256sum -- "$destination")" || return 1
-        current_hash="${current_hash%% *}"
-        initial_destination_hash="$current_hash"
+        initial_destination_fingerprint="$(bosh_managed_txn_fingerprint "$destination")" || return 1
+        initial_destination_id="${initial_destination_fingerprint%/*}"
+        initial_destination_hash="${initial_destination_fingerprint#*/}"
+        current_hash="$initial_destination_hash"
     fi
 
     if (( manifest_exists )); then
@@ -852,23 +852,7 @@ install_managed_file() {
 
         if (( destination_exists )) &&
            [[ "$existed_before" == "1" && "$backup_path" == "-" ]]; then
-            create_backup "$destination" || return 1
-            backup_path="$BOSH_LAST_BACKUP"
-            original_mode="$BOSH_LAST_BACKUP_MODE"
-
-            if [[ ! "$original_mode" =~ ^[0-7]{3,4}$ ]]; then
-                msg error "Could not capture the original file permissions."
-                return 1
-            fi
-
-            if [[ -z "$backup_path" || -L "$backup_path" || ! -f "$backup_path" ]]; then
-                msg error "Backup path could not be verified."
-                return 1
-            fi
-
-            backup_hash="$(sha256sum -- "$backup_path")" || return 1
-            backup_hash="${backup_hash%% *}"
-            backup_path_b64="$(printf '%s' "$backup_path" | base64 -w 0)" || return 1
+            needs_backup=1
         fi
     else
         if (( destination_exists )); then
@@ -887,39 +871,38 @@ install_managed_file() {
                 return 0
             fi
 
-            create_backup "$destination" || return 1
-            backup_path="$BOSH_LAST_BACKUP"
-            original_mode="$BOSH_LAST_BACKUP_MODE"
-
-            if [[ ! "$original_mode" =~ ^[0-7]{3,4}$ ]]; then
-                msg error "Could not capture the original file permissions."
-                return 1
-            fi
-
-            if [[ -z "$backup_path" || -L "$backup_path" || ! -f "$backup_path" ]]; then
-                msg error "Backup path could not be verified."
-                return 1
-            fi
-
-            backup_hash="$(sha256sum -- "$backup_path")" || return 1
-            backup_hash="${backup_hash%% *}"
-            backup_path_b64="$(printf '%s' "$backup_path" | base64 -w 0)" || return 1
+            needs_backup=1
         fi
     fi
 
-    temp_file="$(mktemp "${destination}.bosh-tmp.XXXXXX")" || return 1
+    if (( destination_exists )); then
+        bosh_managed_txn_check_exchange "$destination" || return 1
+    fi
+    if (( needs_backup )); then
+        create_backup "$destination" || return 1
+        backup_path="$BOSH_LAST_BACKUP"
+        original_mode="$BOSH_LAST_BACKUP_MODE"
 
-    bosh_register_temp "$temp_file" file || {
-        bosh_remove_temp_file "$temp_file"
-        return 1
-    }
+        if [[ ! "$original_mode" =~ ^[0-7]{3,4}$ ]]; then
+            msg error "Could not capture the original file permissions."
+            return 1
+        fi
 
-    if ! cp -p -- "$source_file" "$temp_file"; then
-        bosh_remove_temp_file "$temp_file"
-        return 1
+        if [[ -z "$backup_path" || -L "$backup_path" || ! -f "$backup_path" ]]; then
+            msg error "Backup path could not be verified."
+            return 1
+        fi
+
+        backup_hash="$(bosh_managed_txn_hash "$backup_path")" || return 1
+        backup_path_b64="$(printf '%s' "$backup_path" | base64 -w 0)" || return 1
+        if [[ "$backup_hash" != "$initial_destination_hash" ||
+              "$original_mode" != "${initial_destination_id##*:}" ]]; then
+            msg error "Destination changed while its backup was being prepared: $destination"
+            return 1
+        fi
     fi
 
-    # Journal the expected manifest and original backup BEFORE replacement.
+    # Journal the expected manifest before publication.
     if [[ "$backup_path_b64" == "-" ]]; then
         original_mode="-"
     fi
@@ -938,125 +921,31 @@ install_managed_file() {
         pending_manifest+=$'\n'"${manifest_fields[manifest_index]}=${manifest_fields[manifest_index+1]}"
     done
 
+    # The candidate is private, persistent transaction data. A successful
+    # exchange will leave the displaced inode at that same private path.
     bosh_managed_txn_prepare \
-        "$state_key" "$destination" \
-        "${initial_destination_hash:--}" "$source_hash" \
-        "$pending_manifest" || return 1
+        "$state_key" "$destination" "${initial_destination_hash:--}" \
+        "$source_hash" "$pending_manifest" "$initial_destination_id" "$source_file" temp_file || return 1
 
     if (( destination_exists )); then
-        # Use the snapshot prepared inside the private persistent journal.
-        rollback_file="$BOSH_STATE/.${state_key}.managed-pending/previous_destination"
-
-        if ! bosh_verify_rollback_file "$rollback_file" "$initial_destination_hash"; then
-            bosh_remove_temp_file "$temp_file" || true
-            msg error "Rollback snapshot verification failed; preserved: $rollback_file"
+        if [[ "$(bosh_managed_txn_fingerprint "$destination")" != "$initial_destination_fingerprint" ]]; then
+            msg error "Destination changed before publication; journal preserved: $destination"
             return 1
         fi
-
-        current_hash="$(sha256sum -- "$destination")" || {
-            bosh_remove_temp_file "$temp_file" || true
-            bosh_remove_rollback_file "$rollback_file" || true
-            return 1
-        }
-        current_hash="${current_hash%% *}"
-
-        if [[ "$current_hash" != "$initial_destination_hash" ]]; then
-            bosh_remove_temp_file "$temp_file" || true
-            bosh_remove_rollback_file "$rollback_file" || true
-            msg error "Destination changed during installation."
+        if ! mv --exchange --no-copy -T -- "$temp_file" "$destination"; then
+            msg error "Managed publication requires a same-filesystem atomic exchange; journal and slot preserved: ${temp_file%/*}"
             return 1
         fi
-
-        if ! mv -fT -- "$temp_file" "$destination"; then
-            bosh_remove_temp_file "$temp_file" || true
-            bosh_remove_rollback_file "$rollback_file" || true
-            return 1
-        fi
-
-        bosh_forget_temp "$temp_file"
     else
-        if [[ -e "$destination" || -L "$destination" ]]; then
-            bosh_remove_temp_file "$temp_file"
-            msg error "Destination appeared during installation."
+        # link(2) publishes only if the destination is absent, including on
+        # filesystems where a no-clobber rename may require a userspace check.
+        if ! ln -T -- "$temp_file" "$destination"; then
+            msg error "Could not create managed destination without overwriting: $destination"
             return 1
         fi
-
-        if ! mv -nT -- "$temp_file" "$destination"; then
-            bosh_remove_temp_file "$temp_file"
-            return 1
-        fi
-
-        if [[ -e "$temp_file" || -L "$temp_file" ]]; then
-            bosh_remove_temp_file "$temp_file"
-            msg error "Existing destination preserved: $destination"
-            return 1
-        fi
-
-        bosh_forget_temp "$temp_file"
     fi
 
-    file_hash="$(sha256sum -- "$destination")" || {
-        if [[ -n "$rollback_file" ]]; then
-            bosh_restore_rollback_file \
-                "$rollback_file" "$destination" \
-                "$source_hash" "$initial_destination_hash" ||
-                msg error "Rollback recovery needs attention; snapshot path: $rollback_file"
-        else
-            msg warning "Could not verify installed file; destination preserved: $destination"
-        fi
-        return 1
-    }
-    file_hash="${file_hash%% *}"
-
-    if [[ "$file_hash" != "$source_hash" ]]; then
-        if [[ -n "$rollback_file" ]]; then
-            bosh_restore_rollback_file \
-                "$rollback_file" "$destination" \
-                "$source_hash" "$initial_destination_hash" ||
-                msg error "Rollback recovery needs attention; snapshot path: $rollback_file"
-        else
-            msg warning "Unexpected file content; destination preserved: $destination"
-        fi
-
-        msg error "Installed file hash does not match its source."
-        return 1
-    fi
-
-    if [[ "$backup_path_b64" == "-" ]]; then
-        original_mode="-"
-    fi
-
-    manifest_fields=(
-        sha256 "$file_hash"
-        preexisting "$existed_before"
-        destination_b64 "$destination_b64"
-        backup_path_b64 "$backup_path_b64"
-        backup_sha256 "$backup_hash"
-    )
-
-    # Keep the old schema when an existing backup has no recoverable mode.
-    if [[ -n "$original_mode" ]]; then
-        manifest_fields+=(original_mode "$original_mode")
-    fi
-
-    if ! write_manifest "$state_key" managed_file "${manifest_fields[@]}"; then
-
-        if [[ -n "$rollback_file" ]]; then
-            bosh_restore_rollback_file \
-                "$rollback_file" "$destination" \
-                "$file_hash" "$initial_destination_hash" ||
-                msg error "Rollback recovery needs attention; snapshot path: $rollback_file"
-        else
-            bosh_remove_file_if_hash_matches "$destination" "$file_hash" || true
-        fi
-
-        bosh_managed_txn_recover "$state_key" "$destination" || true
-        msg error "Could not register the managed file."
-        return 1
-    fi
-
-    bosh_managed_txn_recover "$state_key" "$destination" || return 1
-    [[ -z "$rollback_file" ]] || bosh_remove_rollback_file "$rollback_file" || true
+    bosh_managed_txn_recover "$state_key" "$destination" after || return 1
 
     if (( existed_before )); then
         msg success "Updated: $destination"
