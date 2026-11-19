@@ -190,6 +190,15 @@ bosh_uninstall_process_managed_file() {
 
     manifest_file="$BOSH_STATE/${key}_manifest"
 
+    # Reconcile a killed installation BEFORE interpreting an absent manifest.
+    # Ambiguous transactions are preserved and block this component removal.
+    if ! bosh_managed_txn_recover "$key" "$destination"; then
+        msg warning "Pending managed-file transaction requires attention: $key"
+        BOSH_UNINSTALL_PRESERVED=$((BOSH_UNINSTALL_PRESERVED + 1))
+        BOSH_UNINSTALL_ERRORS=$((BOSH_UNINSTALL_ERRORS + 1))
+        return 1
+    fi
+
     [[ -e "$manifest_file" || -L "$manifest_file" ]] || return 0
 
     if ! bosh_uninstall_safe_directory "$BOSH_STATE" ||
@@ -335,6 +344,14 @@ bosh_uninstall_process_anime() {
 
     if ! bosh_uninstall_safe_directory "$BOSH_STATE"; then
         msg warning "Unsafe state directory; anime manifests preserved."
+        BOSH_UNINSTALL_PRESERVED=$((BOSH_UNINSTALL_PRESERVED + 1))
+        BOSH_UNINSTALL_ERRORS=$((BOSH_UNINSTALL_ERRORS + 1))
+        return 1
+    fi
+
+    # Reconcile crash-consistency journals BEFORE interpreting any image state.
+    if ! bosh_anime_txn_recover_all; then
+        msg warning "Pending anime image transactions need review; preserving them."
         BOSH_UNINSTALL_PRESERVED=$((BOSH_UNINSTALL_PRESERVED + 1))
         BOSH_UNINSTALL_ERRORS=$((BOSH_UNINSTALL_ERRORS + 1))
         return 1
@@ -615,8 +632,27 @@ bosh_uninstall_process_zsh() {
     local marker_position=""
     local marker_offset=""
     local separator_offset=""
+    local zsh_uninstall_next_hash=""
+    local zsh_uninstall_manifest_hash=""
     local start_count=0
     local end_count=0
+
+    # First reconcile any incomplete uninstallation or installation.
+    if ! bosh_zsh_uninstall_txn_recover; then
+        msg warning "Pending Zsh uninstallation requires manual inspection."
+        BOSH_UNINSTALL_PRESERVED=$((BOSH_UNINSTALL_PRESERVED + 1))
+        BOSH_UNINSTALL_ERRORS=$((BOSH_UNINSTALL_ERRORS + 1))
+        return 1
+    fi
+
+    # A killed installer may have written the manifest but not yet .zshrc.
+    # Never interpret that partial state as a completed integration.
+    if ! bosh_zsh_txn_recover; then
+        msg warning "Pending Zsh integration requires manual inspection."
+        BOSH_UNINSTALL_PRESERVED=$((BOSH_UNINSTALL_PRESERVED + 1))
+        BOSH_UNINSTALL_ERRORS=$((BOSH_UNINSTALL_ERRORS + 1))
+        return 1
+    fi
 
     if [[ ! -e "$manifest_file" && ! -L "$manifest_file" ]]; then
         return 0
@@ -760,6 +796,11 @@ bosh_uninstall_process_zsh() {
         current_hash="$(bosh_uninstall_hash "$zshrc")" || return 1
         [[ "$current_hash" == "$expected_hash" ]] || return 1
 
+        zsh_uninstall_manifest_hash="$(bosh_zsh_txn_hash "$manifest_file")" || return 1
+        bosh_zsh_uninstall_txn_prepare \
+            "$mode" "$current_hash" "$backup_hash" \
+            "$zsh_uninstall_manifest_hash" || return 1
+
         mv -fT -- "$stage" "$zshrc" || return 1
         bosh_forget_temp "$stage"
 
@@ -803,6 +844,16 @@ bosh_uninstall_process_zsh() {
         [[ "$actual_hash" == "$current_hash" ]] || return 1
 
         if [[ "$mode" == "created" && ! -s "$stage" ]]; then
+            zsh_uninstall_next_hash="-"
+        else
+            zsh_uninstall_next_hash="$(bosh_zsh_txn_hash "$stage")" || return 1
+        fi
+        zsh_uninstall_manifest_hash="$(bosh_zsh_txn_hash "$manifest_file")" || return 1
+        bosh_zsh_uninstall_txn_prepare \
+            "$mode" "$current_hash" "$zsh_uninstall_next_hash" \
+            "$zsh_uninstall_manifest_hash" || return 1
+
+        if [[ "$mode" == "created" && ! -s "$stage" ]]; then
             bosh_remove_file_if_hash_matches "$zshrc" "$current_hash" || return 1
             bosh_forget_temp "$stage"
             rm -f -- "$stage"
@@ -814,7 +865,7 @@ bosh_uninstall_process_zsh() {
         BOSH_UNINSTALL_REMOVED=$((BOSH_UNINSTALL_REMOVED + 1))
     fi
 
-    bosh_uninstall_archive zshrc_manifest || {
+    bosh_zsh_uninstall_txn_recover || {
         BOSH_UNINSTALL_ERRORS=$((BOSH_UNINSTALL_ERRORS + 1))
         return 1
     }
@@ -828,6 +879,10 @@ main() {
 
     acquire_install_lock || return 1
     setup_install_traps
+
+    # Recover any interrupted first-time OMZ publication before other writes.
+    bosh_omz_txn_recover || return 1
+    bosh_anime_txn_recover_all || return 1
 
     for key in \
         zsh_config \

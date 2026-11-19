@@ -15,6 +15,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 
 source "$PROJECT_DIR/scripts/lib/common.sh"
+source "$PROJECT_DIR/scripts/lib/managed-transaction.sh"
+source "$PROJECT_DIR/scripts/lib/zsh-transaction.sh"
+source "$PROJECT_DIR/scripts/lib/omz-transaction.sh"
+source "$PROJECT_DIR/scripts/lib/anime-transaction.sh"
 
 # ------------------------------------------------------------
 # Paths
@@ -432,6 +436,9 @@ install_oh_my_zsh() {
     local commit=""
     local tree_hash=""
 
+    # Heal a pending first installation before inspecting any directory.
+    bosh_omz_txn_recover || return 1
+
     if [[ -L "$omz_dir" ]]; then
         msg error "Refusing to use a symbolic link at $omz_dir"
         return 1
@@ -525,6 +532,9 @@ install_oh_my_zsh() {
     }
     tree_hash="${tree_hash%% *}"
 
+    # Publish the new clone's identity BEFORE its manifest or directory.
+    bosh_omz_txn_prepare "$commit" "$tree_hash" || return 1
+
     if ! write_manifest "oh_my_zsh" oh_my_zsh \
         ownership "created" \
         commit "$commit" \
@@ -567,6 +577,8 @@ install_oh_my_zsh() {
         bosh_forget_temp "$clone_parent"
     fi
 
+    # Can also be retried on the next install/uninstall after SIGKILL.
+    bosh_omz_txn_recover || return 1
     msg success "Oh My Zsh installed and registered."
 }
 # ------------------------------------------------------------
@@ -601,6 +613,8 @@ install_managed_file() {
     local -a previous=()
     local -a decoded_values=()
     local -a manifest_fields=()
+    local pending_manifest=""
+    local manifest_index=0
 
     if [[ ! "$state_key" =~ ^[a-zA-Z0-9_-]+$ ]]; then
         msg error "Invalid or missing state key."
@@ -614,6 +628,7 @@ install_managed_file() {
 
     ensure_directory "$BOSH_STATE" || return 1
     ensure_directory "$(dirname "$destination")" || return 1
+    bosh_managed_txn_recover "$state_key" "$destination" || return 1
 
     manifest_file="$BOSH_STATE/${state_key}_manifest"
 
@@ -904,17 +919,33 @@ install_managed_file() {
         return 1
     fi
 
-    if (( destination_exists )); then
-        rollback_file="$(mktemp "${destination}.bosh-rollback.XXXXXX")" || {
-            bosh_remove_temp_file "$temp_file"
-            return 1
-        }
+    # Journal the expected manifest and original backup BEFORE replacement.
+    if [[ "$backup_path_b64" == "-" ]]; then
+        original_mode="-"
+    fi
+    manifest_fields=(
+        sha256 "$source_hash"
+        preexisting "$existed_before"
+        destination_b64 "$destination_b64"
+        backup_path_b64 "$backup_path_b64"
+        backup_sha256 "$backup_hash"
+    )
+    if [[ -n "$original_mode" ]]; then
+        manifest_fields+=(original_mode "$original_mode")
+    fi
+    pending_manifest="version=1"$'\n'"component=managed_file"
+    for ((manifest_index = 0; manifest_index < ${#manifest_fields[@]}; manifest_index += 2)); do
+        pending_manifest+=$'\n'"${manifest_fields[manifest_index]}=${manifest_fields[manifest_index+1]}"
+    done
 
-        if ! cp -p -- "$destination" "$rollback_file"; then
-            bosh_remove_temp_file "$temp_file" || true
-            bosh_remove_rollback_file "$rollback_file" || true
-            return 1
-        fi
+    bosh_managed_txn_prepare \
+        "$state_key" "$destination" \
+        "${initial_destination_hash:--}" "$source_hash" \
+        "$pending_manifest" || return 1
+
+    if (( destination_exists )); then
+        # Use the snapshot prepared inside the private persistent journal.
+        rollback_file="$BOSH_STATE/.${state_key}.managed-pending/previous_destination"
 
         if ! bosh_verify_rollback_file "$rollback_file" "$initial_destination_hash"; then
             bosh_remove_temp_file "$temp_file" || true
@@ -1019,10 +1050,12 @@ install_managed_file() {
             bosh_remove_file_if_hash_matches "$destination" "$file_hash" || true
         fi
 
+        bosh_managed_txn_recover "$state_key" "$destination" || true
         msg error "Could not register the managed file."
         return 1
     fi
 
+    bosh_managed_txn_recover "$state_key" "$destination" || return 1
     [[ -z "$rollback_file" ]] || bosh_remove_rollback_file "$rollback_file" || true
 
     if (( existed_before )); then
@@ -1054,6 +1087,45 @@ install_managed_file_or_skip() {
 # Install anime images without overwriting personal files
 # ------------------------------------------------------------
 
+# Staging paths are only cleaned by the invocation that created them.
+bosh_anime_stage_matches() {
+    local directory="$1" identity="$2"
+
+    [[ ! -L "$directory" && -d "$directory" &&
+       "$(stat -c '%d:%i:%u:%a' -- "$directory")" == "$identity" ]]
+}
+
+bosh_anime_candidate_matches() {
+    local path="$1" identity="$2"
+    local link_count=""
+
+    [[ ! -L "$path" && -f "$path" ]] || return 1
+    link_count="$(stat -c '%h' -- "$path")" || return 1
+    # A linked inode could be reachable outside the private 0700 staging dir.
+    [[ "$link_count" == 1 &&
+       "$(stat -c '%d:%i:%u:%a:%h:%z' -- "$path")" == "$identity" ]]
+}
+
+bosh_cleanup_anime_stage() {
+    local directory="$1" stage_identity="$2" path="$3" file_identity="$4" hash="$5"
+
+    if bosh_anime_stage_matches "$directory" "$stage_identity"; then
+        if [[ -e "$path" || -L "$path" ]]; then
+            if ! bosh_anime_candidate_matches "$path" "$file_identity" ||
+               ! bosh_remove_file_if_hash_matches "$path" "$hash"; then
+                msg warning "Anime staging candidate changed; preserved: $path"
+                return 1
+            fi
+        fi
+
+        # rmdir succeeds only when no other entries are present.
+        rmdir -- "$directory" 2>/dev/null && return 0
+    fi
+
+    msg warning "Anime staging directory preserved: $directory"
+    return 1
+}
+
 install_anime_images() {
     local source_file filename destination_file
     local name_hash state_key manifest_file
@@ -1062,9 +1134,12 @@ install_anime_images() {
     local candidate candidate_filename candidate_key
     local legacy_matches
     local file_hash temp_file rollback_file manifest_value
+    local stage_dir stage_identity file_identity destination_device
+    local rollback_original_mode
     local manifest_owned
     local -a source_files=()
     local -a manifest_lines=()
+    local -a stage_cleanup=()
 
     ensure_directory "$ANIME_DEST" || return 1
     ensure_directory "$BOSH_STATE" || return 1
@@ -1094,6 +1169,9 @@ install_anime_images() {
 
         source_hash="$(sha256sum -- "$source_file")" || return 1
         source_hash="${source_hash%% *}"
+
+        # Heal an interrupted publication before trusting image ownership.
+        bosh_anime_txn_recover "$state_key" "$filename" || return 1
 
         if [[ -L "$manifest_file" ]]; then
             msg error "Refusing to read a symbolic link: $manifest_file"
@@ -1216,86 +1294,126 @@ install_anime_images() {
             fi
         fi
 
-        # Prepare the new image in the destination filesystem.
-        temp_file="$(mktemp "${destination_file}.bosh-tmp.XXXXXX")" || return 1
-
-        bosh_register_temp "$temp_file" file || {
-            bosh_remove_temp_file "$temp_file"
+        # Preserve the source mode for the atomic rename while keeping the
+        # candidate private, even if SIGKILL prevents cleanup.
+        destination_device="$(stat -c '%d' -- "$ANIME_DEST")" || return 1
+        stage_dir="$(umask 077; mktemp -d -- "${destination_file}.bosh-tmp.XXXXXX")" || return 1
+        stage_identity="$(stat -c '%d:%i:%u:%a' -- "$stage_dir")" || return 1
+        if [[ "$stage_identity" != "$destination_device":*:"$EUID":700 &&
+              "$stage_identity" != "$destination_device":*:"$EUID":2700 ]] ||
+           ! bosh_anime_stage_matches "$stage_dir" "$stage_identity"; then
+            msg error "Unsafe anime staging directory; preserved: $stage_dir"
             return 1
-        }
+        fi
 
-        if ! cp -p -- "$source_file" "$temp_file"; then
-            bosh_remove_temp_file "$temp_file"
+        # A setgid destination can pass the bit to a newly created directory.
+        if [[ "$stage_identity" == *:2700 ]]; then
+            chmod g-s -- "$stage_dir" || return 1
+            stage_identity="${stage_identity%:*}:700"
+            bosh_anime_stage_matches "$stage_dir" "$stage_identity" || return 1
+        fi
+
+        temp_file="$stage_dir/image"
+        if ! cp -pT -- "$source_file" "$temp_file"; then
+            msg warning "Incomplete anime staging directory preserved: $stage_dir"
+            return 1
+        fi
+        file_identity="$(stat -c '%d:%i:%u:%a:%h:%z' -- "$temp_file")" || return 1
+
+        stage_cleanup=("$stage_dir" "$stage_identity" "$temp_file" "$file_identity" "$source_hash")
+
+        # Journal the expected hash before modifying the user's image path.
+        if ! bosh_anime_txn_prepare "$state_key" "$filename" "$source_hash"; then
+            bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
             return 1
         fi
 
         rollback_file=""
+        rollback_original_mode=""
 
         if (( manifest_owned )) && [[ -f "$destination_file" ]]; then
+            # Capture the old image mode independently of the snapshot:
+            # the snapshot is private even when the image was 0644.
+            rollback_original_mode="$(stat -c '%a' -- "$destination_file")" || {
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
+                return 1
+            }
+            if [[ ! "$rollback_original_mode" =~ ^[0-7]{3,4}$ ]]; then
+                msg error "Invalid original anime image mode: $destination_file"
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
+                return 1
+            fi
+
             rollback_file="$(mktemp "${destination_file}.bosh-rollback.XXXXXX")" || {
-                bosh_remove_temp_file "$temp_file"
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 return 1
             }
 
-            if ! cp -p -- "$destination_file" "$rollback_file"; then
-                bosh_remove_temp_file "$temp_file" || true
+            # mktemp creates a 0600 file. cp (without -p) does not copy the
+            # source mode onto an existing destination. Verify before use.
+            if [[ -L "$rollback_file" || ! -f "$rollback_file" ]] ||
+               ! cp -- "$destination_file" "$rollback_file" ||
+               [[ "$(stat -c '%a' -- "$rollback_file")" != 600 ]]; then
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 bosh_remove_rollback_file "$rollback_file" || true
+                msg error "Could not prepare a private anime snapshot: $filename"
                 return 1
             fi
 
             if ! bosh_verify_rollback_file "$rollback_file" "$previous_hash"; then
-                bosh_remove_temp_file "$temp_file" || true
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 msg error "Anime rollback snapshot verification failed; preserved: $rollback_file"
                 return 1
             fi
 
             current_hash="$(sha256sum -- "$destination_file")" || {
-                bosh_remove_temp_file "$temp_file" || true
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 bosh_remove_rollback_file "$rollback_file" || true
                 return 1
             }
             current_hash="${current_hash%% *}"
 
             if [[ "$current_hash" != "$previous_hash" ]]; then
-                bosh_remove_temp_file "$temp_file" || true
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 bosh_remove_rollback_file "$rollback_file" || true
                 msg warning "Anime image changed during update; preserved: $filename"
                 continue
             fi
 
-            if ! mv -fT -- "$temp_file" "$destination_file"; then
-                bosh_remove_temp_file "$temp_file" || true
+            if ! bosh_anime_stage_matches "$stage_dir" "$stage_identity" ||
+               ! bosh_anime_candidate_matches "$temp_file" "$file_identity" ||
+               ! mv -fT -- "$temp_file" "$destination_file"; then
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 bosh_remove_rollback_file "$rollback_file" || true
                 return 1
             fi
-
-            bosh_forget_temp "$temp_file"
         else
             if [[ -e "$destination_file" || -L "$destination_file" ]]; then
-                bosh_remove_temp_file "$temp_file"
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 msg warning "Existing destination preserved: $filename"
                 continue
             fi
 
-            if ! mv -nT -- "$temp_file" "$destination_file"; then
-                bosh_remove_temp_file "$temp_file"
+            if ! bosh_anime_stage_matches "$stage_dir" "$stage_identity" ||
+               ! bosh_anime_candidate_matches "$temp_file" "$file_identity" ||
+               ! mv -nT -- "$temp_file" "$destination_file"; then
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 return 1
             fi
 
             if [[ -e "$temp_file" || -L "$temp_file" ]]; then
-                bosh_remove_temp_file "$temp_file"
+                bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
                 msg warning "Destination appeared during installation; preserved: $filename"
                 continue
             fi
-
-            bosh_forget_temp "$temp_file"
         fi
+        bosh_cleanup_anime_stage "${stage_cleanup[@]}" || true
 
         file_hash="$(sha256sum -- "$destination_file")" || {
             if [[ -n "$rollback_file" ]]; then
                 bosh_restore_rollback_file \
                     "$rollback_file" "$destination_file" \
-                    "$source_hash" "$previous_hash" ||
+                    "$source_hash" "$previous_hash" "$rollback_original_mode" ||
                     msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
             else
                 msg warning "Could not verify anime image; destination preserved: $destination_file"
@@ -1308,7 +1426,7 @@ install_anime_images() {
             if [[ -n "$rollback_file" ]]; then
                 bosh_restore_rollback_file \
                     "$rollback_file" "$destination_file" \
-                    "$source_hash" "$previous_hash" ||
+                    "$source_hash" "$previous_hash" "$rollback_original_mode" ||
                     msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
             else
                 msg warning "Unexpected anime image content; destination preserved: $destination_file"
@@ -1328,7 +1446,7 @@ install_anime_images() {
             if [[ -n "$rollback_file" ]]; then
                 bosh_restore_rollback_file \
                     "$rollback_file" "$destination_file" \
-                    "$file_hash" "$previous_hash" ||
+                    "$file_hash" "$previous_hash" "$rollback_original_mode" ||
                     msg error "Anime rollback recovery needs attention; snapshot path: $rollback_file"
             else
                 bosh_remove_file_if_hash_matches "$destination_file" "$file_hash" || true
@@ -1339,6 +1457,7 @@ install_anime_images() {
         fi
 
         [[ -z "$rollback_file" ]] || bosh_remove_rollback_file "$rollback_file" || true
+        bosh_anime_txn_recover "$state_key" "$filename" || return 1
 
         msg success "Installed or updated anime image: $filename"
     done
@@ -1625,6 +1744,12 @@ integrate_zsh() {
     local current_umask=""
     local created_mode=""
     local original_mode="-"
+    local next_zshrc_hash=""
+    local manifest_payload=""
+
+    # Reconcile an interrupted previous integration before touching .zshrc.
+    bosh_zsh_uninstall_txn_recover || return 1
+    bosh_zsh_txn_recover || return 1
 
     if [[ -L "$zshrc" ]]; then
         msg error "Refusing to modify a symbolic link at $HOME/.zshrc."
@@ -1801,6 +1926,14 @@ integrate_zsh() {
         }
     fi
 
+    # Publish intent before the manifest or user-owned .zshrc can change.
+    next_zshrc_hash="$(bosh_zsh_txn_hash "$temp_file")" || return 1
+    printf -v manifest_payload \
+        'version=1\ncomponent=zsh_integration\nmode=%s\nblock_sha256=%s\nbackup_path_b64=%s\nbackup_sha256=%s\noriginal_mode=%s' \
+        "$mode" "$block_hash" "$backup_path_b64" "$backup_hash" "$original_mode"
+    bosh_zsh_txn_prepare \
+        "$mode" "${original_hash:--}" "$next_zshrc_hash" "$manifest_payload" || return 1
+
     if ! write_manifest "zshrc" zsh_integration \
         mode "$mode" \
         block_sha256 "$block_hash" \
@@ -1808,6 +1941,7 @@ integrate_zsh() {
         backup_sha256 "$backup_hash" \
         original_mode "$original_mode"; then
         bosh_remove_temp_file "$temp_file"
+        bosh_zsh_txn_recover || true
         msg error "Could not register the Zsh integration."
         return 1
     fi
@@ -1815,13 +1949,13 @@ integrate_zsh() {
     if [[ "$mode" == "created" ]]; then
         if ! mv -nT -- "$temp_file" "$zshrc"; then
             bosh_remove_temp_file "$temp_file"
-            rm -f -- "$manifest_file"
+            bosh_zsh_txn_recover || true
             return 1
         fi
 
         if [[ -e "$temp_file" ]]; then
             bosh_remove_temp_file "$temp_file"
-            rm -f -- "$manifest_file"
+            bosh_zsh_txn_recover || true
             msg error "Another $HOME/.zshrc appeared. Existing file preserved."
             return 1
         fi
@@ -1830,24 +1964,57 @@ integrate_zsh() {
     else
         if ! mv -fT -- "$temp_file" "$zshrc"; then
             bosh_remove_temp_file "$temp_file"
-            rm -f -- "$manifest_file"
+            bosh_zsh_txn_recover || true
             return 1
         fi
 
         bosh_forget_temp "$temp_file"
     fi
 
+    # Verify destination + manifest before retiring the pending journal.
+    bosh_zsh_txn_recover || return 1
     msg success "Bosh Terminal integrated into $HOME/.zshrc."
 }
 # ------------------------------------------------------------
 # Main installation
 # ------------------------------------------------------------
 
+request_install_consent() {
+  say \
+    "Bosh Terminal instalará o actualizará configuraciones y podrá recuperar operaciones interrumpidas." \
+    "Bosh Terminal will install or update configurations and may recover interrupted operations."
+
+  printf 'HOME: %s\n' "$HOME"
+  printf 'BOSH_HOME: %s\n' "$BOSH_HOME"
+  printf 'BOSH_STATE: %s\n' "$BOSH_STATE"
+  printf 'BOSH_BACKUP: %s\n' "$BOSH_BACKUP"
+
+  if ! confirm \
+    "¿Autorizas la instalación y recuperación de Bosh Terminal?" \
+    "Do you authorize Bosh Terminal installation and recovery?"; then
+    msg warning "Installation authorization declined."
+    return 1
+  fi
+}
+
 main() {
     preflight || return 1
 
+  request_install_consent || return 1
+
     acquire_install_lock || return 1
     setup_install_traps
+
+    # Recover before further installation changes, while holding the lock.
+    bosh_managed_txn_recover zsh_config "$BOSH_HOME/zshrc" || return 1
+    bosh_managed_txn_recover starship "$BOSH_HOME/starship.toml" || return 1
+    bosh_managed_txn_recover fastfetch "$BOSH_HOME/fastfetch.jsonc" || return 1
+    bosh_managed_txn_recover konsole_profile "$KONSOLE_DIR/bosh.profile" || return 1
+    bosh_managed_txn_recover konsole_scheme "$KONSOLE_DIR/Utterly-Sweet-Konsole.colorscheme" || return 1
+    bosh_zsh_uninstall_txn_recover || return 1
+    bosh_zsh_txn_recover || return 1
+    bosh_omz_txn_recover || return 1
+    bosh_anime_txn_recover_all || return 1
 
     install_dependencies || return 1
     install_oh_my_zsh || return 1

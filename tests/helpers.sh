@@ -38,6 +38,9 @@ test_case() {
         XDG_CONFIG_HOME="$TEST_ACTIVE_HOME/.config" \
         XDG_STATE_HOME="$TEST_ACTIVE_HOME/.local/state" \
         XDG_DATA_HOME="$TEST_ACTIVE_HOME/.local/share" \
+        BOSH_HOME="$TEST_ACTIVE_HOME/.config/bosh-terminal" \
+        BOSH_STATE="$TEST_ACTIVE_HOME/.local/state/bosh-terminal" \
+        BOSH_BACKUP="$TEST_ACTIVE_HOME/.config/bosh-backups/bosh-terminal" \
         BOSH_LANG=es \
         bash --noprofile --norc -eEuo pipefail -c "$case_script"; then
 
