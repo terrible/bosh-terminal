@@ -185,4 +185,26 @@ integrate_zsh
 [[ "$(grep -Fxc '# >>> Bosh Terminal >>>' "$HOME/.zshrc")" == 1 ]]
 CASE
 
+
+test_case "Zsh H1: SIGKILL before .zshrc rename preserves original" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+printf 'alias original="echo original"\n' > "$HOME/.zshrc"
+original_hash="$(sha256sum "$HOME/.zshrc" | cut -d ' ' -f 1)"
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    mv() {
+        if [[ "${*: -1}" == "$HOME/.zshrc" ]]; then kill -KILL "$BASHPID"; fi
+        command mv "$@"
+    }
+    integrate_zsh
+' || status=$?
+[[ "$status" -eq 137 ]]
+[[ -f "$BOSH_STATE/zshrc_manifest" && -f "$BOSH_STATE/zshrc_txn" ]]
+[[ "$(sha256sum "$HOME/.zshrc" | cut -d ' ' -f 1)" == "$original_hash" ]]
+bosh_zsh_txn_recover
+[[ ! -e "$BOSH_STATE/zshrc_txn" && ! -e "$BOSH_STATE/zshrc_manifest" ]]
+[[ "$(sha256sum "$HOME/.zshrc" | cut -d ' ' -f 1)" == "$original_hash" ]]
+CASE
+
 test_summary
