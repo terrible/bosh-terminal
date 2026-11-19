@@ -171,7 +171,7 @@ grep -Fq 'review=1' <<< "$output"
 [[ -f "$BOSH_STATE/oh_my_zsh_txn" ]]
 CASE
 
-test_case "Temp audit: actual interrupted anime update exposes rollback mode" <<'CASE'
+test_case "Temp audit: interrupted anime update keeps 0600 rollback despite 0644 image" <<'CASE'
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/anime-source"
 ANIME_DEST="$HOME/.local/share/fastfetch/anime"
@@ -196,11 +196,14 @@ shopt -s nullglob
 rollbacks=( "$ANIME_DEST"/bosh1.png.bosh-rollback.* )
 [[ "${#rollbacks[@]}" -eq 1 ]]
 [[ "$(cat "${rollbacks[0]}")" == 'ORIGINAL SNAPSHOT' ]]
-[[ "$(stat -c '%a' -- "${rollbacks[0]}")" == 644 ]]
+[[ "$(stat -c '%a' -- "${rollbacks[0]}")" == 600 ]]
 status=0
 output="$(bash "$BOSH_TEST_PROJECT/scripts/audit-temp-artifacts.sh")" || status=$?
-[[ "$status" -eq 2 ]]
-grep -Fq 'group-or-world-access;mode=644' <<< "$output"
+[[ "$status" -eq 0 ]]
+grep -Fq 
+[[ -f "${rollbacks[0]}" ]]
+[[ "$(cat "$ANIME_DEST/bosh1.png")" == 'ORIGINAL SNAPSHOT' ]]REVIEW\tanime-rollback\t' <<< "$output"
+grep -Fq 'mode=600' <<< "$output"
 [[ -f "${rollbacks[0]}" ]]
 [[ "$(cat "$ANIME_DEST/bosh1.png")" == 'ORIGINAL SNAPSHOT' ]]
 CASE
