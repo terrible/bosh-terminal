@@ -29,7 +29,7 @@ bosh_anime_txn_prepare() {
     local key="$1" filename="$2" new_hash="$3"
     local destination="$ANIME_DEST/$filename"
     local state="$BOSH_STATE/$key" journal="$BOSH_STATE/${key}_txn"
-    local encoded old_hash='-' old_state_hash='-'
+    local encoded old_hash='-' old_state_hash='-' previous_mode='-'
     local expected_hash
 
     bosh_anime_txn_validate_key "$key" "$filename" || return 1
@@ -41,6 +41,9 @@ bosh_anime_txn_prepare() {
     [[ ! -e "$journal" && ! -L "$journal" ]] || return 1
     if [[ -f "$destination" ]]; then
         old_hash="$(bosh_anime_txn_hash "$destination")" || return 1
+        # Remember original permissions separately from a 0600 snapshot.
+        previous_mode="$(stat -c '%a' -- "$destination")" || return 1
+        [[ "$previous_mode" =~ ^[0-7]{3,4}$ ]] || return 1
     fi
     if [[ -f "$state" ]]; then
         old_state_hash="$(bosh_anime_txn_hash "$state")" || return 1
@@ -60,7 +63,8 @@ filename_b64=$encoded
 previous_sha256=$old_hash
 next_sha256=$new_hash
 previous_state_sha256=$old_state_hash
-next_state_sha256=$expected_hash"
+next_state_sha256=$expected_hash
+previous_mode=$previous_mode"
 }
 
 bosh_anime_txn_recover() {
@@ -68,6 +72,7 @@ bosh_anime_txn_recover() {
     local destination="$ANIME_DEST/$filename"
     local state="$BOSH_STATE/$key" journal="$BOSH_STATE/${key}_txn"
     local previous_hash next_hash previous_state next_state
+    local previous_mode='' actual_mode
     local current_hash='-' current_state='-' expected_payload expected_hash
     local uid
     local -a record=()
@@ -82,7 +87,7 @@ bosh_anime_txn_recover() {
     [[ "$(stat -c '%u' -- "$journal")" == "$uid" &&
        "$(stat -c '%a' -- "$journal")" == 600 ]] || return 1
     mapfile -t record < "$journal" || return 1
-    (( ${#record[@]} == 7 )) || return 1
+    (( ${#record[@]} == 7 || ${#record[@]} == 8 )) || return 1
 
     encoded="$(printf '%s' "$filename" | base64 -w 0)" || return 1
     [[ "${record[0]}" == version=1 &&
@@ -102,6 +107,18 @@ bosh_anime_txn_recover() {
        ( "$previous_state" == '-' || "$previous_state" =~ ^[a-f0-9]{64}$ ) &&
        "$next_state" =~ ^[a-f0-9]{64}$ &&
        "$previous_hash" != "$next_hash" ]] || return 1
+
+    # Existing seven-line journals remain readable; new journals preserve
+    # the previous image mode separately from the private snapshot.
+    if (( ${#record[@]} == 8 )); then
+        [[ "${record[7]}" == previous_mode=* ]] || return 1
+        previous_mode="${record[7]#previous_mode=}"
+        if [[ "$previous_hash" == '-' ]]; then
+            [[ "$previous_mode" == '-' ]] || return 1
+        else
+            [[ "$previous_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+        fi
+    fi
 
     expected_payload="$(bosh_anime_txn_expected "$encoded" "$next_hash")" || return 1
     expected_hash="$(printf '%s\n' "$expected_payload" | sha256sum)" || return 1
@@ -133,6 +150,15 @@ bosh_anime_txn_recover() {
 
     if [[ "$current_hash" == "$previous_hash" &&
           "$current_state" == "$previous_state" ]]; then
+        # After a crash between publishing the private restoration stage
+        # and chmod, preserve the journal instead of forgetting the mode.
+        if [[ -n "$previous_mode" && "$previous_mode" != '-' ]]; then
+            actual_mode="$(stat -c '%a' -- "$destination")" || return 1
+            if [[ "$actual_mode" != "$previous_mode" ]]; then
+                msg warning "Original anime mode differs after interruption; preserving journal: $filename"
+                return 1
+            fi
+        fi
         archive_state "${key}_txn" || return 1
         msg info "Unpublished anime transaction archived: $filename"
         return 0
@@ -159,7 +185,7 @@ bosh_anime_txn_recover_all() {
         [[ "$key" =~ ^anime_[a-f0-9]{64}$ ]] || return 1
         [[ ! -L "$path" && -f "$path" ]] || return 1
         mapfile -t entries < "$path" || return 1
-        (( ${#entries[@]} == 7 )) || return 1
+        (( ${#entries[@]} == 7 || ${#entries[@]} == 8 )) || return 1
         [[ "${entries[2]}" == filename_b64=* ]] || return 1
         encoded="${entries[2]#filename_b64=}"
         [[ "$encoded" =~ ^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$ ]] || return 1
