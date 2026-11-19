@@ -52,7 +52,7 @@ bosh_zsh_txn_recover() {
     local old_hash new_hash manifest_expected mode
     local current_hash='-' manifest_hash='-'
     local backup_encoded backup_path backup_hash decoded_hash
-    local actual_mode file_mode actual_uid
+    local file_mode actual_uid
     local -a record=()
 
     [[ ! -L "$BOSH_STATE" ]] || return 1
