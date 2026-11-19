@@ -98,6 +98,7 @@ manifest_before="$(sha256sum "$BOSH_STATE/starship_manifest")"
 manifest_before="${manifest_before%% *}"
 file_before="$(sha256sum "$BOSH_HOME/starship.toml")"
 file_before="${file_before%% *}"
+mode_before="$(stat -c '%a' "$BOSH_HOME/starship.toml")"
 
 if bosh_uninstall_process_managed_file starship; then
     echo "ERROR: se aceptó un modo original inválido."
@@ -111,7 +112,7 @@ file_after="${file_after%% *}"
 
 [[ "$manifest_before" == "$manifest_after" ]]
 [[ "$file_before" == "$file_after" ]]
-[[ "$(stat -c '%a' "$BOSH_HOME/starship.toml")" == "644" ]]
+[[ "$(stat -c '%a' "$BOSH_HOME/starship.toml")" == "$mode_before" ]]
 [[ "$BOSH_UNINSTALL_ERRORS" -eq 1 ]]
 [[ "$BOSH_UNINSTALL_PRESERVED" -eq 1 ]]
 
@@ -542,6 +543,10 @@ CASE
 
 test_case "O-1: roundtrip completo con personalizaciones y recursos preservados" <<'CASE'
 source "$BOSH_TEST_PROJECT/install.sh"
+request_install_consent() {
+    # Consentimiento simulado solo en este caso aislado.
+    return 0
+}
 
 TEST_OMZ_REMOTE="https://github.com/ohmyzsh/ohmyzsh.git"
 TEST_REAL_GIT="$(command -v git)"
