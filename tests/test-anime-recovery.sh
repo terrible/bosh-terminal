@@ -31,6 +31,9 @@ bash --noprofile --norc -euo pipefail -c '
 bosh_anime_txn_recover_all
 [[ -f "$BOSH_STATE/$key" && ! -e "$BOSH_STATE/${key}_txn" ]]
 source "$BOSH_TEST_PROJECT/uninstall.sh"
+# Sourcing uninstall.sh reloads defaults from install.sh; restore fixture paths.
+ANIME_SOURCE="$HOME/mock-source"
+ANIME_DEST="$HOME/mock-dest"
 bosh_uninstall_process_anime
 [[ ! -e "$ANIME_DEST/bosh1.png" ]]
 CASE
@@ -209,6 +212,9 @@ bash --noprofile --norc -euo pipefail -c '
 [[ "$status" -eq 86 ]]
 [[ -f "$ANIME_DEST/bosh1.png" && -f "$BOSH_STATE/${key}_txn" && ! -e "$BOSH_STATE/$key" ]]
 source "$BOSH_TEST_PROJECT/uninstall.sh"
+# Sourcing uninstall.sh reloads defaults from install.sh; restore fixture paths.
+ANIME_SOURCE="$HOME/mock-source"
+ANIME_DEST="$HOME/mock-dest"
 bosh_uninstall_process_anime
 [[ ! -e "$ANIME_DEST/bosh1.png" ]]
 [[ ! -e "$BOSH_STATE/${key}_txn" ]]
