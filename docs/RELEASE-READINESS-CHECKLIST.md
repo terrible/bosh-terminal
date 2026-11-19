@@ -19,7 +19,8 @@
 - [x] Consentimiento interactivo obligatorio antes de lock y recuperación en `install.sh`: 6/6 pruebas específicas, E2E 4/4 y desinstalación 19/19 reportadas en EndeavourOS ([PR #8](https://github.com/terrible/bosh-terminal/pull/8)).
 - [x] Diario H1 **auténtico**: rechazo y ausencia de TTY conservan diario, destino, respaldo y metadatos; 1/1 PASS local; suite integral **19/19 módulos PASS, 0 fallidos** sobre `5d8c4f0` en worktree aislado ([PR #10](https://github.com/terrible/bosh-terminal/pull/10)).
 - [x] Candidata `fa956b1`: Bash/ShellCheck/H1 Ubuntu y suite Arch sin TTY, **2/2 trabajos PASS** en [push](https://github.com/terrible/bosh-terminal/actions/runs/44471564440) y **2/2 PASS** en [pull request](https://github.com/terrible/bosh-terminal/actions/runs/44471613661).
-- [x] Validación inicial de CI endurecida sobre `c19ade3`: nuevos pines de `actions/checkout`, imagen Arch por digest y `ubuntu-24.04` aprobados en [push #44472535769](https://github.com/terrible/bosh-terminal/actions/runs/44472535769) y [PR #44472606853](https://github.com/terrible/bosh-terminal/actions/runs/44472606853), ambos **2/2 trabajos PASS**. Ver [mantenimiento de CI](CI-REGRESSION-MAINTENANCE.md).
+- [x] Validación inicial de CI endurecida con `actions/checkout` v4.2.2 (evidencia histórica, **no pin final**) e imagen Arch por digest: [push #44472535769](https://github.com/terrible/bosh-terminal/actions/runs/44472535769) y [PR #44472606853](https://github.com/terrible/bosh-terminal/actions/runs/44472606853), ambos **2/2 trabajos PASS**.
+- [ ] Verificar la actualización final a `actions/checkout` v7.0.1, fijada por commit, junto con la misma imagen Arch y `ubuntu-24.04`; registrar CI de push y PR tras concluir. Ver [mantenimiento de CI](CI-REGRESSION-MAINTENANCE.md).
 
 
 ## Bloqueos pendientes antes de una versión pública
