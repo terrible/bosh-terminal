@@ -1979,8 +1979,28 @@ integrate_zsh() {
 # Main installation
 # ------------------------------------------------------------
 
+request_install_consent() {
+  say \
+    "Bosh Terminal instalará o actualizará configuraciones y podrá recuperar operaciones interrumpidas." \
+    "Bosh Terminal will install or update configurations and may recover interrupted operations."
+
+  printf 'HOME: %s\n' "$HOME"
+  printf 'BOSH_HOME: %s\n' "$BOSH_HOME"
+  printf 'BOSH_STATE: %s\n' "$BOSH_STATE"
+  printf 'BOSH_BACKUP: %s\n' "$BOSH_BACKUP"
+
+  if ! confirm \
+    "¿Autorizas la instalación y recuperación de Bosh Terminal?" \
+    "Do you authorize Bosh Terminal installation and recovery?"; then
+    msg warning "Installation authorization declined."
+    return 1
+  fi
+}
+
 main() {
     preflight || return 1
+
+  request_install_consent || return 1
 
     acquire_install_lock || return 1
     setup_install_traps

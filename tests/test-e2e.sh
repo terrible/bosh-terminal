@@ -44,6 +44,10 @@ export -f test_setup_omz_git
 
 test_case "E2E: instalación completa, repetición y personalizaciones" <<'CASE'
 source "$BOSH_TEST_PROJECT/install.sh"
+request_install_consent() {
+    # Consentimiento simulado solo en este caso aislado.
+    return 0
+}
 
 test_setup_omz_git
 package_installed() { return 0; }
@@ -111,6 +115,10 @@ CASE
 
 test_case "E2E S4: bloque eliminado, manifiesto huérfano y reintegración" <<'CASE'
 source "$BOSH_TEST_PROJECT/install.sh"
+request_install_consent() {
+    # Consentimiento simulado solo en este caso aislado.
+    return 0
+}
 test_setup_omz_git
 package_installed() { return 0; }
 
@@ -144,6 +152,10 @@ CASE
 
 test_case "E2E S10: edición del bloque Zsh preservada durante reinstalación" <<'CASE'
 source "$BOSH_TEST_PROJECT/install.sh"
+request_install_consent() {
+    # Consentimiento simulado solo en este caso aislado.
+    return 0
+}
 test_setup_omz_git
 package_installed() { return 0; }
 
