@@ -1652,6 +1652,7 @@ integrate_zsh() {
     local manifest_payload=""
 
     # Reconcile an interrupted previous integration before touching .zshrc.
+    bosh_zsh_uninstall_txn_recover || return 1
     bosh_zsh_txn_recover || return 1
 
     if [[ -L "$zshrc" ]]; then
@@ -1894,6 +1895,7 @@ main() {
     bosh_managed_txn_recover fastfetch "$BOSH_HOME/fastfetch.jsonc" || return 1
     bosh_managed_txn_recover konsole_profile "$KONSOLE_DIR/bosh.profile" || return 1
     bosh_managed_txn_recover konsole_scheme "$KONSOLE_DIR/Utterly-Sweet-Konsole.colorscheme" || return 1
+    bosh_zsh_uninstall_txn_recover || return 1
     bosh_zsh_txn_recover || return 1
 
     install_dependencies || return 1
