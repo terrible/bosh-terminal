@@ -51,7 +51,7 @@ No necesita `sudo`. Actualmente se encuentra solo en la rama de desarrollo H1, n
 
 `tests/test-temp-artifacts.sh` crea `HOME` y `XDG_DATA_HOME` aislados. Los escenarios incluyen: directorio vacío, clonación privada, rollback privado con hash, staging temporal/restauración, modo `0644`, symlink, hardlink, nombre inesperado, clonación simbólica, permisos de directorio no privados, symlink en un padre XDG, rechazo de parámetros destructivos, `SIGKILL` real durante publicación Oh My Zsh y actualización anime interrumpida con rollback residual.
 
-La CI comprueba sintaxis y ShellCheck del auditor y ejecuta estas pruebas sin `sudo` ni modificaciones del `HOME` real. Consultar el historial de [GitHub Actions en la rama H1](https://github.com/terrible/bosh-terminal/actions/workflows/h1-regression.yml).
+La CI comprueba sintaxis y ShellCheck del auditor y ejecuta estas pruebas sin `sudo` ni modificaciones del `HOME` real. **[Ejecución #44445178671](https://github.com/terrible/bosh-terminal/actions/runs/44445178671): 14/14 escenarios de auditoría PASS, suite completa Arch 16/16 módulos PASS, jobs Ubuntu y Arch 2/2 PASS.**
 
 ## Plan de remediación: aún no implementado
 
