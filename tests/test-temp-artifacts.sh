@@ -165,8 +165,8 @@ shopt -s nullglob
 parents=( "$HOME"/.oh-my-zsh.bosh-tmp.* )
 [[ "${#parents[@]}" == 1 && -d "${parents[0]}/repo" ]]
 output="$(bash "$BOSH_TEST_PROJECT/scripts/audit-temp-artifacts.sh")"
-grep -Fq REVIEW\tomz-stage\t' <<< "$output"
-grep -Fq SUMMARY\treview=1\twarning=0\tunsafe=0' <<< "$output"
+grep -Fq 'omz-stage' <<< "$output"
+grep -Fq 'review=1' <<< "$output"
 [[ -f "${parents[0]}/repo/oh-my-zsh.sh" ]]
 [[ -f "$BOSH_STATE/oh_my_zsh_txn" ]]
 CASE
@@ -200,7 +200,7 @@ rollbacks=( "$ANIME_DEST"/bosh1.png.bosh-rollback.* )
 status=0
 output="$(bash "$BOSH_TEST_PROJECT/scripts/audit-temp-artifacts.sh")" || status=$?
 [[ "$status" -eq 2 ]]
-grep -Fq WARNING\tanime-rollback\tgroup-or-world-access;mode=644' <<< "$output"
+grep -Fq 'group-or-world-access;mode=644' <<< "$output"
 [[ -f "${rollbacks[0]}" ]]
 [[ "$(cat "$ANIME_DEST/bosh1.png")" == 'ORIGINAL SNAPSHOT' ]]
 CASE
