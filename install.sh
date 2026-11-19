@@ -16,6 +16,7 @@ PROJECT_DIR="$SCRIPT_DIR"
 
 source "$PROJECT_DIR/scripts/lib/common.sh"
 source "$PROJECT_DIR/scripts/lib/managed-transaction.sh"
+source "$PROJECT_DIR/scripts/lib/zsh-transaction.sh"
 
 # ------------------------------------------------------------
 # Paths
@@ -1647,6 +1648,11 @@ integrate_zsh() {
     local current_umask=""
     local created_mode=""
     local original_mode="-"
+    local next_zshrc_hash=""
+    local manifest_payload=""
+
+    # Reconcile an interrupted previous integration before touching .zshrc.
+    bosh_zsh_txn_recover || return 1
 
     if [[ -L "$zshrc" ]]; then
         msg error "Refusing to modify a symbolic link at $HOME/.zshrc."
@@ -1823,6 +1829,14 @@ integrate_zsh() {
         }
     fi
 
+    # Publish intent before the manifest or user-owned .zshrc can change.
+    next_zshrc_hash="$(bosh_zsh_txn_hash "$temp_file")" || return 1
+    printf -v manifest_payload \
+        'version=1\ncomponent=zsh_integration\nmode=%s\nblock_sha256=%s\nbackup_path_b64=%s\nbackup_sha256=%s\noriginal_mode=%s' \
+        "$mode" "$block_hash" "$backup_path_b64" "$backup_hash" "$original_mode"
+    bosh_zsh_txn_prepare \
+        "$mode" "${original_hash:--}" "$next_zshrc_hash" "$manifest_payload" || return 1
+
     if ! write_manifest "zshrc" zsh_integration \
         mode "$mode" \
         block_sha256 "$block_hash" \
@@ -1830,6 +1844,7 @@ integrate_zsh() {
         backup_sha256 "$backup_hash" \
         original_mode "$original_mode"; then
         bosh_remove_temp_file "$temp_file"
+        bosh_zsh_txn_recover || true
         msg error "Could not register the Zsh integration."
         return 1
     fi
@@ -1837,13 +1852,13 @@ integrate_zsh() {
     if [[ "$mode" == "created" ]]; then
         if ! mv -nT -- "$temp_file" "$zshrc"; then
             bosh_remove_temp_file "$temp_file"
-            rm -f -- "$manifest_file"
+            bosh_zsh_txn_recover || true
             return 1
         fi
 
         if [[ -e "$temp_file" ]]; then
             bosh_remove_temp_file "$temp_file"
-            rm -f -- "$manifest_file"
+            bosh_zsh_txn_recover || true
             msg error "Another $HOME/.zshrc appeared. Existing file preserved."
             return 1
         fi
@@ -1852,13 +1867,15 @@ integrate_zsh() {
     else
         if ! mv -fT -- "$temp_file" "$zshrc"; then
             bosh_remove_temp_file "$temp_file"
-            rm -f -- "$manifest_file"
+            bosh_zsh_txn_recover || true
             return 1
         fi
 
         bosh_forget_temp "$temp_file"
     fi
 
+    # Verify destination + manifest before retiring the pending journal.
+    bosh_zsh_txn_recover || return 1
     msg success "Bosh Terminal integrated into $HOME/.zshrc."
 }
 # ------------------------------------------------------------
@@ -1877,6 +1894,7 @@ main() {
     bosh_managed_txn_recover fastfetch "$BOSH_HOME/fastfetch.jsonc" || return 1
     bosh_managed_txn_recover konsole_profile "$KONSOLE_DIR/bosh.profile" || return 1
     bosh_managed_txn_recover konsole_scheme "$KONSOLE_DIR/Utterly-Sweet-Konsole.colorscheme" || return 1
+    bosh_zsh_txn_recover || return 1
 
     install_dependencies || return 1
     install_oh_my_zsh || return 1
