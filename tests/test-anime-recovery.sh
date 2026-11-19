@@ -4,7 +4,6 @@ set -uo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/helpers.sh"
 
 test_case "Anime H1: first image crash before manifest is adopted and removable" <<'CASE'
-set -x
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/mock-source"
 ANIME_DEST="$HOME/mock-dest"
@@ -19,8 +18,9 @@ bash --noprofile --norc -euo pipefail -c '
     ANIME_DEST="$HOME/mock-dest"
     name_hash="$(printf bosh1.png | sha256sum)"
     key="anime_${name_hash%% *}"
+    TEST_MANIFEST_PATH="$BOSH_STATE/$key"
     mv() {
-        if [[ "${*: -1}" == "$BOSH_STATE/$key" ]]; then exit 86; fi
+        if [[ "${*: -1}" == "$TEST_MANIFEST_PATH" ]]; then exit 86; fi
         command mv "$@"
     }
     install_anime_images
@@ -36,7 +36,6 @@ bosh_uninstall_process_anime
 CASE
 
 test_case "Anime H1: managed image update is reconciled after SIGKILL" <<'CASE'
-set -x
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/mock-source"
 ANIME_DEST="$HOME/mock-dest"
@@ -54,8 +53,9 @@ bash --noprofile --norc -euo pipefail -c '
     ANIME_DEST="$HOME/mock-dest"
     name_hash="$(printf bosh1.png | sha256sum)"
     key="anime_${name_hash%% *}"
+    TEST_MANIFEST_PATH="$BOSH_STATE/$key"
     mv() {
-        if [[ "${*: -1}" == "$BOSH_STATE/$key" ]]; then kill -KILL "$BASHPID"; fi
+        if [[ "${*: -1}" == "$TEST_MANIFEST_PATH" ]]; then kill -KILL "$BASHPID"; fi
         command mv "$@"
     }
     install_anime_images
@@ -103,7 +103,6 @@ install_anime_images
 CASE
 
 test_case "Anime H1: external edit after crash is preserved without adoption" <<'CASE'
-set -x
 source "$BOSH_TEST_PROJECT/install.sh"
 ANIME_SOURCE="$HOME/mock-source"
 ANIME_DEST="$HOME/mock-dest"
@@ -121,8 +120,9 @@ bash --noprofile --norc -euo pipefail -c '
     ANIME_DEST="$HOME/mock-dest"
     name_hash="$(printf bosh1.png | sha256sum)"
     key="anime_${name_hash%% *}"
+    TEST_MANIFEST_PATH="$BOSH_STATE/$key"
     mv() {
-        if [[ "${*: -1}" == "$BOSH_STATE/$key" ]]; then exit 86; fi
+        if [[ "${*: -1}" == "$TEST_MANIFEST_PATH" ]]; then exit 86; fi
         command mv "$@"
     }
     install_anime_images
@@ -199,13 +199,15 @@ bash --noprofile --norc -euo pipefail -c '
     ANIME_DEST="$HOME/mock-dest"
     name_hash="$(printf bosh1.png | sha256sum)"
     key="anime_${name_hash%% *}"
+    TEST_MANIFEST_PATH="$BOSH_STATE/$key"
     mv() {
-        if [[ "${*: -1}" == "$BOSH_STATE/$key" ]]; then exit 86; fi
+        if [[ "${*: -1}" == "$TEST_MANIFEST_PATH" ]]; then exit 86; fi
         command mv "$@"
     }
     install_anime_images
 ' || status=$?
 [[ "$status" -eq 86 ]]
+[[ -f "$ANIME_DEST/bosh1.png" && -f "$BOSH_STATE/${key}_txn" && ! -e "$BOSH_STATE/$key" ]]
 source "$BOSH_TEST_PROJECT/uninstall.sh"
 bosh_uninstall_process_anime
 [[ ! -e "$ANIME_DEST/bosh1.png" ]]
