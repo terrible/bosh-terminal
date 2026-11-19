@@ -38,6 +38,8 @@ for mode in 600 640 644; do
     [[ "${#snapshots[@]}" == 1 ]]
     [[ "$(cat "${snapshots[0]}")" == "ORIGINAL-$mode" ]]
     [[ "$(stat -c '%a' "${snapshots[0]}")" == 600 ]]
+    name_hash="$(printf "%s" "$filename" | sha256sum)"
+    grep -Fxq "previous_mode=$mode" "$BOSH_STATE/anime_${name_hash%% *}_txn"
 done
 CASE
 
@@ -141,6 +143,122 @@ if bosh_restore_rollback_file "$snapshot" "$destination" "$new_hash" "$old_hash"
 fi
 [[ "$(cat "$destination")" == CURRENT ]]
 [[ -f "$snapshot" && "$(stat -c '%a' "$snapshot")" == 600 ]]
+CASE
+
+
+test_case "Anime journal: old 7-line format remains recoverable" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+ANIME_SOURCE="$HOME/assets"
+ANIME_DEST="$HOME/images"
+mkdir -p "$ANIME_SOURCE"
+printf 'ORIGINAL\n' > "$ANIME_SOURCE/bosh1.png"
+chmod 640 "$ANIME_SOURCE/bosh1.png"
+install_anime_images
+printf 'CANDIDATE\n' > "$ANIME_SOURCE/bosh1.png"
+name_hash="$(printf bosh1.png | sha256sum)"
+key="anime_${name_hash%% *}"
+result=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    ANIME_SOURCE="$HOME/assets"
+    ANIME_DEST="$HOME/images"
+    mv() {
+        if [[ "${*: -1}" == "$ANIME_DEST/bosh1.png" ]]; then exit 86; fi
+        command mv "$@"
+    }
+    install_anime_images
+' || result=$?
+[[ "$result" -eq 86 ]]
+journal="$BOSH_STATE/${key}_txn"
+[[ "$(wc -l < "$journal")" -eq 8 ]]
+# Remove only the last field to emulate a journal from the previous version.
+sed -i '$d' "$journal"
+[[ "$(wc -l < "$journal")" -eq 7 ]]
+[[ "$(stat -c '%a' "$journal")" == 600 ]]
+bosh_anime_txn_recover_all
+[[ ! -e "$journal" ]]
+[[ "$(cat "$ANIME_DEST/bosh1.png")" == ORIGINAL ]]
+[[ "$(stat -c '%a' "$ANIME_DEST/bosh1.png")" == 640 ]]
+CASE
+
+test_case "Anime journal: SIGKILL between rename and chmod preserves original mode evidence" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+ANIME_SOURCE="$HOME/assets"
+ANIME_DEST="$HOME/images"
+mkdir -p "$ANIME_SOURCE"
+printf 'ORIGINAL\n' > "$ANIME_SOURCE/bosh1.png"
+chmod 644 "$ANIME_SOURCE/bosh1.png"
+install_anime_images
+printf 'CANDIDATE\n' > "$ANIME_SOURCE/bosh1.png"
+name_hash="$(printf bosh1.png | sha256sum)"
+key="anime_${name_hash%% *}"
+result=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    ANIME_SOURCE="$HOME/assets"
+    ANIME_DEST="$HOME/images"
+    TEST_MANIFEST="$BOSH_STATE/$1"
+    mv() {
+        if [[ "${*: -1}" == "$TEST_MANIFEST" ]]; then return 86; fi
+        command mv "$@"
+    }
+    chmod() {
+        if [[ "${*: -1}" == "$ANIME_DEST/bosh1.png" ]]; then
+            kill -KILL "$BASHPID"
+        fi
+        command chmod "$@"
+    }
+    install_anime_images
+' _ "$key" || result=$?
+[[ "$result" -eq 137 ]]
+[[ "$(cat "$ANIME_DEST/bosh1.png")" == ORIGINAL ]]
+[[ "$(stat -c '%a' "$ANIME_DEST/bosh1.png")" == 600 ]]
+journal="$BOSH_STATE/${key}_txn"
+[[ -f "$journal" ]]
+grep -Fxq 'previous_mode=644' "$journal"
+shopt -s nullglob
+snapshots=( "$ANIME_DEST"/bosh1.png.bosh-rollback.* )
+[[ "${#snapshots[@]}" -eq 1 ]]
+[[ "$(stat -c '%a' "${snapshots[0]}")" == 600 ]]
+if bosh_anime_txn_recover_all; then
+    echo 'ERROR: uncertain original image mode silently reconciled'
+    exit 1
+fi
+[[ -f "$journal" && -f "${snapshots[0]}" ]]
+CASE
+
+test_case "Anime journal: invalid original mode is rejected without modifying data" <<'CASE'
+source "$BOSH_TEST_PROJECT/install.sh"
+ANIME_SOURCE="$HOME/assets"
+ANIME_DEST="$HOME/images"
+mkdir -p "$ANIME_SOURCE"
+printf 'ORIGINAL\n' > "$ANIME_SOURCE/bosh1.png"
+chmod 640 "$ANIME_SOURCE/bosh1.png"
+install_anime_images
+printf 'CANDIDATE\n' > "$ANIME_SOURCE/bosh1.png"
+name_hash="$(printf bosh1.png | sha256sum)"
+key="anime_${name_hash%% *}"
+result=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/install.sh"
+    ANIME_SOURCE="$HOME/assets"
+    ANIME_DEST="$HOME/images"
+    mv() {
+        if [[ "${*: -1}" == "$ANIME_DEST/bosh1.png" ]]; then exit 86; fi
+        command mv "$@"
+    }
+    install_anime_images
+' || result=$?
+[[ "$result" -eq 86 ]]
+journal="$BOSH_STATE/${key}_txn"
+sed -i 's/^previous_mode=640$/previous_mode=bad/' "$journal"
+before="$(bosh_file_sha256 "$ANIME_DEST/bosh1.png")"
+if bosh_anime_txn_recover_all; then
+    echo 'ERROR: corrupted mode accepted'
+    exit 1
+fi
+[[ "$(bosh_file_sha256 "$ANIME_DEST/bosh1.png")" == "$before" ]]
+[[ -f "$journal" && "$(stat -c '%a' "$ANIME_DEST/bosh1.png")" == 640 ]]
 CASE
 
 test_summary
