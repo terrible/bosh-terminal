@@ -16,7 +16,7 @@ El workflow único es `.github/workflows/h1-regression.yml`:
 
 | Componente | Referencia | Verificación |
 |---|---|---|
-| `actions/checkout` | `11bd71901bbe5b1630ceea73d27597364c9af683` (`v4.2.2`) | `https://api.github.com/repos/actions/checkout/git/ref/tags/v4.2.2` |
+| `actions/checkout` | `3d3c42e5aac5ba805825da76410c181273ba90b1` (`v7.0.1`) | `https://api.github.com/repos/actions/checkout/git/ref/tags/v7.0.1` |
 | Contenedor oficial Arch | `archlinux:base-20261108.0.623074@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899` | Docker Hub: índice de imagen de `library/archlinux` `base-20261108.0.623074` |
 | Runner GitHub | `ubuntu-24.04` | Etiqueta de versión del runner (no hash inmutable) |
 
