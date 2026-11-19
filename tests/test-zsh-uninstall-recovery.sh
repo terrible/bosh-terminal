@@ -156,4 +156,27 @@ fi
 [[ -f "$BOSH_STATE/zshrc_uninstall_txn" ]]
 CASE
 
+
+test_case "Zsh uninstall H1: SIGKILL after removing block preserves custom aliases" <<'CASE'
+source "$BOSH_TEST_PROJECT/uninstall.sh"
+printf 'alias important="echo important"\n' > "$HOME/.zshrc"
+original_hash="$(sha256sum "$HOME/.zshrc" | cut -d ' ' -f 1)"
+integrate_zsh
+status=0
+bash --noprofile --norc -euo pipefail -c '
+    source "$BOSH_TEST_PROJECT/uninstall.sh"
+    archive_state() {
+        if [[ "$1" == zshrc_manifest ]]; then kill -KILL "$BASHPID"; fi
+        command false
+    }
+    bosh_uninstall_process_zsh
+' || status=$?
+[[ "$status" -eq 137 ]]
+[[ -f "$BOSH_STATE/zshrc_manifest" && -f "$BOSH_STATE/zshrc_uninstall_txn" ]]
+[[ "$(sha256sum "$HOME/.zshrc" | cut -d ' ' -f 1)" == "$original_hash" ]]
+bosh_uninstall_process_zsh
+[[ ! -e "$BOSH_STATE/zshrc_manifest" && ! -e "$BOSH_STATE/zshrc_uninstall_txn" ]]
+[[ "$(sha256sum "$HOME/.zshrc" | cut -d ' ' -f 1)" == "$original_hash" ]]
+CASE
+
 test_summary
