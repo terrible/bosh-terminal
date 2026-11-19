@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - integration/bosh-terminal-candidate
+      - hardening/ci-release-checklist
+      - main
   pull_request:
     branches:
       - main
@@ -19,10 +21,10 @@ concurrency:
 jobs:
   bash-and-h1:
     name: Bash, ShellCheck and H1 recovery
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Install ShellCheck
@@ -42,7 +44,7 @@ jobs:
 
   arch-full-suite:
     name: Full regression on Arch Linux (non-root, no TTY)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: archlinux:latest
     timeout-minutes: 20
@@ -50,7 +52,7 @@ jobs:
       - name: Install test prerequisites
         run: |
           pacman -Syu --noconfirm --needed git shellcheck diffutils sudo util-linux
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Bash syntax and ShellCheck
