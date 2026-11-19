@@ -147,3 +147,104 @@ bosh_zsh_txn_recover() {
     msg error "Ambiguous Zsh transaction; user file and manifest preserved: $journal"
     return 1
 }
+
+# Uninstallation uses a separate journal because the final .zshrc may be
+# absent, restored from backup, or contain user-owned content without Bosh.
+bosh_zsh_uninstall_txn_prepare() {
+    local mode="$1" previous="$2" next="$3" manifest_expected="$4"
+    local journal="$BOSH_STATE/zshrc_uninstall_txn"
+    local manifest="$BOSH_STATE/zshrc_manifest"
+    local zshrc="$HOME/.zshrc"
+
+    [[ "$mode" =~ ^(created|appended|legacy_replaced)$ ]] || return 1
+    [[ "$previous" =~ ^[a-f0-9]{64}$ ]] || return 1
+    [[ "$next" == '-' || "$next" =~ ^[a-f0-9]{64}$ ]] || return 1
+    [[ "$manifest_expected" =~ ^[a-f0-9]{64}$ ]] || return 1
+    [[ "$previous" != "$next" ]] || return 1
+    bosh_managed_txn_safe_directory "$BOSH_STATE" || return 1
+    bosh_managed_txn_safe_directory "$HOME" || return 1
+    [[ ! -e "$journal" && ! -L "$journal" ]] || return 1
+    [[ "$(bosh_zsh_txn_hash "$zshrc")" == "$previous" ]] || return 1
+    [[ "$(bosh_zsh_txn_hash "$manifest")" == "$manifest_expected" ]] || return 1
+
+    write_state zshrc_uninstall_txn \
+        "version=1
+component=zsh_uninstall
+mode=$mode
+previous_sha256=$previous
+next_sha256=$next
+manifest_sha256=$manifest_expected"
+}
+
+bosh_zsh_uninstall_txn_recover() {
+    local journal="$BOSH_STATE/zshrc_uninstall_txn"
+    local manifest="$BOSH_STATE/zshrc_manifest"
+    local zshrc="$HOME/.zshrc"
+    local mode previous next expected_manifest
+    local dest_hash='-' manifest_hash='-' uid
+    local -a record=()
+
+    [[ ! -L "$BOSH_STATE" ]] || return 1
+    [[ -e "$journal" || -L "$journal" ]] || return 0
+    bosh_managed_txn_safe_directory "$BOSH_STATE" || return 1
+    bosh_managed_txn_safe_directory "$HOME" || return 1
+    [[ ! -L "$journal" && -f "$journal" ]] || return 1
+    uid="$(id -u)" || return 1
+    [[ "$(stat -c '%u' -- "$journal")" == "$uid" &&
+       "$(stat -c '%a' -- "$journal")" == 600 ]] || return 1
+    mapfile -t record < "$journal" || return 1
+    (( ${#record[@]} == 6 )) || return 1
+    [[ "${record[0]}" == version=1 &&
+       "${record[1]}" == component=zsh_uninstall &&
+       "${record[2]}" == mode=* &&
+       "${record[3]}" == previous_sha256=* &&
+       "${record[4]}" == next_sha256=* &&
+       "${record[5]}" == manifest_sha256=* ]] || return 1
+
+    mode="${record[2]#mode=}"
+    previous="${record[3]#previous_sha256=}"
+    next="${record[4]#next_sha256=}"
+    expected_manifest="${record[5]#manifest_sha256=}"
+
+    [[ "$mode" =~ ^(created|appended|legacy_replaced)$ &&
+       "$previous" =~ ^[a-f0-9]{64}$ &&
+       ( "$next" == '-' || "$next" =~ ^[a-f0-9]{64}$ ) &&
+       "$previous" != "$next" &&
+       "$expected_manifest" =~ ^[a-f0-9]{64}$ ]] || return 1
+    [[ ! -L "$zshrc" && ( ! -e "$zshrc" || -f "$zshrc" ) ]] || return 1
+    [[ ! -L "$manifest" && ( ! -e "$manifest" || -f "$manifest" ) ]] || return 1
+
+    if [[ -f "$zshrc" ]]; then
+        dest_hash="$(bosh_zsh_txn_hash "$zshrc")" || return 1
+    fi
+    if [[ -f "$manifest" ]]; then
+        manifest_hash="$(bosh_zsh_txn_hash "$manifest")" || return 1
+    fi
+    [[ "$manifest_hash" == '-' || "$manifest_hash" == "$expected_manifest" ]] || {
+        msg error "Unrecognized Zsh uninstall manifest; transaction preserved."
+        return 1
+    }
+
+    if [[ "$dest_hash" == "$previous" &&
+          "$manifest_hash" == "$expected_manifest" ]]; then
+        # No .zshrc modification occurred. Cancel the planned uninstall;
+        # next attempt can rebuild the stage safely.
+        archive_state zshrc_uninstall_txn || return 1
+        msg info "Incomplete Zsh uninstallation cancelled; original retained."
+        return 0
+    fi
+
+    if [[ "$dest_hash" == "$next" ]]; then
+        if [[ "$manifest_hash" == "$expected_manifest" ]]; then
+            archive_state zshrc_manifest || return 1
+        fi
+        # An interrupted archive_state may already have archived the
+        # manifest. Finish idempotently without touching the user file.
+        archive_state zshrc_uninstall_txn || return 1
+        msg info "Interrupted Zsh uninstallation finalized safely."
+        return 0
+    fi
+
+    msg error "Ambiguous Zsh uninstallation state; preserving: $journal"
+    return 1
+}
