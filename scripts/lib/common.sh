@@ -476,6 +476,9 @@ bosh_restore_rollback_file() {
     local destination="${2:-}"
     local expected_current="${3:-}"
     local expected_previous="${4:-}"
+    # Optional fifth arg: original destination mode. Older callers can
+    # continue using the snapshot's mode; anime callers must supply it.
+    local restore_mode="${5:-}"
     local current_hash=""
     local stage=""
     local stage_hash=""
@@ -488,6 +491,23 @@ bosh_restore_rollback_file() {
     fi
 
     bosh_verify_rollback_file "$rollback" "$expected_previous" || return 1
+
+    if [[ -z "$restore_mode" ]]; then
+        # Backward compatibility for managed-file rollback snapshots.
+        restore_mode="$(stat -c '%a' -- "$rollback")" || return 1
+    else
+        # New anime rollback snapshots are *always* private. A previously
+        # exposed snapshot or a changed mode is not accepted silently.
+        if [[ "$(stat -c '%a' -- "$rollback")" != 600 ]]; then
+            msg error "Anime rollback snapshot is not private; preserving: $rollback"
+            return 1
+        fi
+    fi
+
+    if [[ ! "$restore_mode" =~ ^[0-7]{3,4}$ ]]; then
+        msg error "Invalid original file mode; preserving rollback: $rollback"
+        return 1
+    fi
 
     if [[ -L "$destination" || ! -f "$destination" ]]; then
         msg warning "Destination changed; rollback preserved: $rollback"
@@ -511,9 +531,12 @@ bosh_restore_rollback_file() {
         return 1
     fi
 
-    if ! cp -p -- "$rollback" "$stage"; then
+    # mktemp creates mode 0600. cp without -p retains that mode; the
+    # previous image's permissions are reapplied only after publication.
+    if ! cp -- "$rollback" "$stage" ||
+       [[ "$(stat -c '%a' -- "$stage")" != 600 ]]; then
         bosh_remove_temp_file "$stage" || true
-        msg error "Could not stage rollback snapshot; preserved: $rollback"
+        msg error "Could not stage private rollback snapshot; preserved: $rollback"
         return 1
     fi
 
@@ -557,6 +580,15 @@ bosh_restore_rollback_file() {
 
     if [[ "$current_hash" != "$expected_previous" ]]; then
         msg error "Restored destination hash mismatch; rollback preserved: $rollback"
+        return 1
+    fi
+
+    # The private 0600 restoration stage is renamed atomically first.
+    # Only the destination receives its original mode; the rollback
+    # snapshot remains 0600 until its verified cleanup.
+    if ! chmod -- "$restore_mode" "$destination" ||
+       [[ "$(stat -c '%a' -- "$destination")" != "$restore_mode" ]]; then
+        msg error "Restored image mode could not be verified; rollback preserved: $rollback"
         return 1
     fi
 
