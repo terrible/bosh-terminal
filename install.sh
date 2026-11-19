@@ -17,6 +17,7 @@ PROJECT_DIR="$SCRIPT_DIR"
 source "$PROJECT_DIR/scripts/lib/common.sh"
 source "$PROJECT_DIR/scripts/lib/managed-transaction.sh"
 source "$PROJECT_DIR/scripts/lib/zsh-transaction.sh"
+source "$PROJECT_DIR/scripts/lib/omz-transaction.sh"
 
 # ------------------------------------------------------------
 # Paths
@@ -434,6 +435,9 @@ install_oh_my_zsh() {
     local commit=""
     local tree_hash=""
 
+    # Heal a pending first installation before inspecting any directory.
+    bosh_omz_txn_recover || return 1
+
     if [[ -L "$omz_dir" ]]; then
         msg error "Refusing to use a symbolic link at $omz_dir"
         return 1
@@ -527,6 +531,9 @@ install_oh_my_zsh() {
     }
     tree_hash="${tree_hash%% *}"
 
+    # Publish the new clone's identity BEFORE its manifest or directory.
+    bosh_omz_txn_prepare "$commit" "$tree_hash" || return 1
+
     if ! write_manifest "oh_my_zsh" oh_my_zsh \
         ownership "created" \
         commit "$commit" \
@@ -569,6 +576,8 @@ install_oh_my_zsh() {
         bosh_forget_temp "$clone_parent"
     fi
 
+    # Can also be retried on the next install/uninstall after SIGKILL.
+    bosh_omz_txn_recover || return 1
     msg success "Oh My Zsh installed and registered."
 }
 # ------------------------------------------------------------
@@ -1897,6 +1906,7 @@ main() {
     bosh_managed_txn_recover konsole_scheme "$KONSOLE_DIR/Utterly-Sweet-Konsole.colorscheme" || return 1
     bosh_zsh_uninstall_txn_recover || return 1
     bosh_zsh_txn_recover || return 1
+    bosh_omz_txn_recover || return 1
 
     install_dependencies || return 1
     install_oh_my_zsh || return 1
