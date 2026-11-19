@@ -627,6 +627,15 @@ bosh_uninstall_process_zsh() {
     local start_count=0
     local end_count=0
 
+    # A killed installer may have written the manifest but not yet .zshrc.
+    # Never interpret that partial state as a completed integration.
+    if ! bosh_zsh_txn_recover; then
+        msg warning "Pending Zsh integration requires manual inspection."
+        BOSH_UNINSTALL_PRESERVED=$((BOSH_UNINSTALL_PRESERVED + 1))
+        BOSH_UNINSTALL_ERRORS=$((BOSH_UNINSTALL_ERRORS + 1))
+        return 1
+    fi
+
     if [[ ! -e "$manifest_file" && ! -L "$manifest_file" ]]; then
         return 0
     fi
