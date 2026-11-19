@@ -15,12 +15,14 @@
 - [x] Suite actual completa en contenedor Arch: 15/15 módulos PASS (CI #44439239909).
 - [x] Bash syntax y ShellCheck PASS en las ramas probadas.
 - [x] Auditoría de residuos temporal **solo lectura**, con pruebas de `SIGKILL` reales sobre clonación OMZ y rollback anime: **14/14 PASS**, suite Arch **16/16 módulos PASS** ([CI #44445178671](https://github.com/terrible/bosh-terminal/actions/runs/44445178671)); ver [reporte](TEMP-ARTIFACTS-AUDIT.md).
+- [x] Protección del modo de snapshots anime: **8/8** pruebas (incluidos `SIGKILL`, diarios históricos y restauración de modos), **17/17** módulos del proyecto en Arch, Bash/ShellCheck y **2/2** jobs aprobados ([CI #44447701673](https://github.com/terrible/bosh-terminal/actions/runs/44447701673)).
 
 ## Bloqueos pendientes antes de una versión pública
 
 - [ ] Auditar las condiciones de carrera y los enlaces simbólicos en rutas involucradas en diarios y renombrados, incluyendo procesos externos al lock.
 - [ ] Definir un procedimiento seguro para identificar y limpiar snapshots de rollback anime y carpetas de clonación Oh My Zsh que permanezcan tras `SIGKILL`, sin borrar datos personales desconocidos.
-- [ ] Evitar que snapshots de rollback retengan permisos amplios heredados por `cp -p` (modo `0644` observado en test real), conservando el modo original cuando sea necesaria una restauración.
+- [x] Snapshots anime de rollback `0600` y recuperación de permisos originales `0600`/`0640`/`0644`, con modo persistente en diario compatible con registros anteriores; probado en CI #44447701673.
+- [ ] Endurecer por separado el staging de **candidatos** anime `*.bosh-tmp.*`, que puede conservar `0644` bajo `cp -p`; resolver sin cambiar los permisos finales ni debilitar la recuperación.
 - [ ] Definir el alcance de durabilidad frente a `SIGKILL` versus pérdida de energía; si se promete recuperación ante apagón, implementar y ensayar `fsync` de archivos y directorios.
 - [ ] Revisar la política de versión de Oh My Zsh upstream y la coherencia de commit/hash de árbol en repositorios preexistentes.
 - [ ] Confirmar colección anime distribuible, atribución y licencias de recursos gráficos.
