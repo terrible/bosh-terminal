@@ -105,6 +105,14 @@ inspect_image() {
     fi
     basename="${BASH_REMATCH[1]}"
     kind="anime-${BASH_REMATCH[2]}"
+    if [[ "$kind" == anime-tmp && "$basename" != *'..'* && ! -L "$path" && -d "$path" ]]; then
+        if [[ "$(stat -c '%u:%a' -- "$path")" == "$owner_uid:700" ]]; then
+            emit REVIEW anime-stage "$path" "private-dir;ownership-unproven"
+        else
+            emit UNSAFE anime-stage "$path" "owner-or-mode-not-private"
+        fi
+        return
+    fi
     if [[ "$basename" == *'..'* || -L "$path" || ! -f "$path" ]]; then
         emit UNSAFE "$kind" "$path" "symlink-nonregular-or-unsafe-name"
         return

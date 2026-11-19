@@ -54,16 +54,19 @@ bash --noprofile --norc -euo pipefail -c '
     source "$BOSH_TEST_PROJECT/install.sh"
     ANIME_SOURCE="$HOME/mock-source"
     ANIME_DEST="$HOME/mock-dest"
-    name_hash="$(printf bosh1.png | sha256sum)"
-    key="anime_${name_hash%% *}"
-    TEST_MANIFEST_PATH="$BOSH_STATE/$key"
+    TEST_DEST="$ANIME_DEST/bosh1.png"
     mv() {
-        if [[ "${*: -1}" == "$TEST_MANIFEST_PATH" ]]; then kill -KILL "$BASHPID"; fi
-        command mv "$@"
+        command mv "$@" || return
+        if [[ "${*: -1}" == "$TEST_DEST" ]]; then kill -KILL "$BASHPID"; fi
     }
     install_anime_images
 ' || status=$?
 [[ "$status" -eq 137 ]]
+shopt -s nullglob
+stages=( "$ANIME_DEST"/bosh1.png.bosh-tmp.* )
+[[ "${#stages[@]}" -eq 1 && -d "${stages[0]}" ]]
+[[ "$(stat -c '%a' -- "${stages[0]}")" == 700 ]]
+[[ ! -e "${stages[0]}/image" ]]
 [[ "$(cat "$ANIME_DEST/bosh1.png")" == "V2 ANIME" ]]
 [[ "$(bosh_anime_txn_hash "$BOSH_STATE/$key")" == "$old_manifest" ]]
 [[ -f "$BOSH_STATE/${key}_txn" ]]
@@ -72,6 +75,7 @@ bosh_anime_txn_recover_all
 grep -Fxq "sha256=$(bosh_anime_txn_hash "$ANIME_DEST/bosh1.png")" "$BOSH_STATE/$key"
 install_anime_images
 [[ "$(cat "$ANIME_DEST/bosh1.png")" == "V2 ANIME" ]]
+[[ -d "${stages[0]}" ]]
 CASE
 
 test_case "Anime H1: crash before destination rename keeps prior version" <<'CASE'
